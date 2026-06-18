@@ -7,6 +7,7 @@ import typer
 from pydantic import ValidationError
 
 from tifq import __version__
+from tifq.backtest import run_backtest_from_config
 from tifq.bars import build_bar_files
 from tifq.config import ConfigLoadError, load_backtest_config
 from tifq.data import import_taifex_ticks
@@ -74,7 +75,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 8 - Backtest Engine.",
+        "Bootstrap complete. Next milestone: Task 9 - Metrics and Reports.",
         fg=typer.colors.GREEN,
     )
 
@@ -162,11 +163,16 @@ def backtest(
         typer.Option(help="Path to YAML config."),
     ] = Path("configs/v1_backtest.yaml"),
 ) -> None:
-    """Validate a backtest config. Execution is planned for Task 8."""
+    """Run a conservative next-bar-open backtest from a YAML config."""
     try:
         loaded_config = load_backtest_config(config)
     except (ConfigLoadError, ValidationError) as exc:
         typer.secho(f"Config validation failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        result = run_backtest_from_config(loaded_config)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"Backtest failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
     typer.secho(f"Config validated successfully: {config}", fg=typer.colors.GREEN)
@@ -176,7 +182,14 @@ def backtest(
         f"{loaded_config.data.timeframe} bars, "
         f"{loaded_config.data.start_date} to {loaded_config.data.end_date}."
     )
-    typer.secho("Backtesting execution is planned for Task 8 - Backtest Engine.")
+    typer.secho(
+        "Backtest completed with conservative next-bar-open execution.",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(f"Trades: {result.metrics['trade_count']}")
+    typer.echo(f"Final equity: {result.metrics['final_equity']:.2f}")
+    typer.echo(f"Net PnL: {result.metrics['net_pnl']:.2f}")
+    typer.echo("Persisted reports are planned for Task 9 - Metrics and Reports.")
 
 
 @app_group.command("backtest-lab")

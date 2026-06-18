@@ -12,7 +12,8 @@ V1 focuses on reproducible local research only:
 - indicator calculation
 - strategy signal generation
 - conservative next-bar-open backtesting
-- cost, slippage, metrics, and report output
+- cost and slippage accounting
+- metrics and report output
 - local Streamlit Backtest Lab
 
 V1 explicitly excludes broker APIs, live feeds, paper live trading, simulated broker order placement, and real-money trading.
@@ -51,9 +52,10 @@ Task 4 completed: TAIFEX CSV/ZIP import and tick cleaning.
 Task 5 completed: tick Parquet to 1m/5m OHLCV bars.
 Task 6 completed: EMA, VWAP, ATR, and realized volatility indicators.
 Task 7 completed: strategy interface and VWAP Trend signals.
-Current next task: Task 8 - Backtest Engine.
+Task 8 completed: conservative next-bar-open backtest engine.
+Current next task: Task 9 - Metrics and Reports.
 
-The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Backtesting execution and Streamlit UI are implemented in later tasks.
+The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command validates `configs/v1_backtest.yaml`, loads configured bar Parquet files, calculates indicators, generates VWAP Trend signals, and runs conservative next-bar-open execution. Persisted metrics/report files and the Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 
