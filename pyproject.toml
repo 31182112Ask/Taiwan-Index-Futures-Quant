@@ -27,6 +27,7 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "pandas-stubs",
     "types-PyYAML",
 ]
 

@@ -46,9 +46,10 @@ tifq app backtest-lab
 
 Task 1 completed: project bootstrap.
 Task 2 completed: config loading and validation.
-Current next task: Task 3 — Data Schemas and Storage.
+Task 3 completed: data schemas and Parquet storage helpers.
+Current next task: Task 4 — TAIFEX Importer.
 
-The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Data import, bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
+The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. TAIFEX import, tick cleaning, bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 
