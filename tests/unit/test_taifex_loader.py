@@ -57,7 +57,11 @@ def test_import_taifex_ticks_from_zip_uses_column_mapping(tmp_path: Path) -> Non
     raw_dir.mkdir()
     csv_content = "\n".join(
         [
-            "商品代號,到期月份,成交日期,成交時間,成交價格,成交數量",
+            (
+                "\u5546\u54c1\u4ee3\u865f,\u5230\u671f\u6708\u4efd,"
+                "\u6210\u4ea4\u65e5\u671f,\u6210\u4ea4\u6642\u9593,"
+                "\u6210\u4ea4\u50f9\u683c,\u6210\u4ea4\u6578\u91cf"
+            ),
             "TMF,202606,2026-06-17,08:45:00,22000,1",
             "TMF,202606,2026-06-17,08:45:01,22001,2",
         ]
@@ -74,6 +78,31 @@ def test_import_taifex_ticks_from_zip_uses_column_mapping(tmp_path: Path) -> Non
     loaded = read_parquet(summary.output_paths[0])
     assert loaded["contract"].tolist() == ["202606", "202606"]
     assert loaded["source"].tolist() == ["taifex.zip:inner/ticks.csv", "taifex.zip:inner/ticks.csv"]
+
+
+def test_import_taifex_ticks_prefers_trade_date_and_time_columns(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    write_text(
+        raw_dir / "ticks.csv",
+        "\n".join(
+            [
+                (
+                    "\u5546\u54c1\u4ee3\u865f,\u5230\u671f\u6708\u4efd,"
+                    "\u4ea4\u6613\u65e5\u671f,\u4ea4\u6613\u6642\u9593,"
+                    "\u6210\u4ea4\u50f9\u683c,\u6210\u4ea4\u6578\u91cf"
+                ),
+                "TMF,202606,2026-06-17,08:45:00,22000,1",
+            ]
+        ),
+    )
+
+    summary = import_taifex_ticks(raw_dir, processed_dir)
+
+    assert summary.output_paths == (processed_dir / "ticks" / "TMF" / "2026-06-17.parquet",)
+    loaded = read_parquet(summary.output_paths[0])
+    assert loaded.loc[0, "timestamp"].date().isoformat() == "2026-06-17"
 
 
 def test_discover_taifex_files_returns_only_csv_and_zip(tmp_path: Path) -> None:

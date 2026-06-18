@@ -57,7 +57,6 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "timestamp",
         "datetime",
         "date_time",
-        "\u4ea4\u6613\u6642\u9593",
         "\u6210\u4ea4\u6642\u9593\u6233",
         "\u6210\u4ea4\u65e5\u671f\u6642\u9593",
     ),
@@ -285,13 +284,13 @@ def _build_timestamp_column(
     trade_date_column: str | None,
     trade_time_column: str | None,
 ) -> pd.Series:
+    if trade_date_column is not None and trade_time_column is not None:
+        trade_date = _column_series(df, trade_date_column).astype(str).str.strip()
+        trade_time = _column_series(df, trade_time_column).astype(str).str.strip()
+        return trade_date + " " + trade_time
     if timestamp_column is not None:
         return _column_series(df, timestamp_column)
-    if trade_date_column is None or trade_time_column is None:
-        raise TaifexImportError("timestamp cannot be built without date and time columns")
-    trade_date = _column_series(df, trade_date_column).astype(str).str.strip()
-    trade_time = _column_series(df, trade_time_column).astype(str).str.strip()
-    return trade_date + " " + trade_time
+    raise TaifexImportError("timestamp cannot be built without timestamp or date/time columns")
 
 
 def _column_series(df: pd.DataFrame, column: str) -> pd.Series:
