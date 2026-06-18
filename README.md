@@ -47,9 +47,10 @@ tifq app backtest-lab
 Task 1 completed: project bootstrap.
 Task 2 completed: config loading and validation.
 Task 3 completed: data schemas and Parquet storage helpers.
-Current next task: Task 4 — TAIFEX Importer.
+Task 4 completed: TAIFEX CSV/ZIP import and tick cleaning.
+Current next task: Task 5 — Bar Builder.
 
-The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. TAIFEX import, tick cleaning, bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
+The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 

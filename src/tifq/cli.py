@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from tifq import __version__
 from tifq.config import ConfigLoadError, load_backtest_config
+from tifq.data import import_taifex_ticks
 
 app = typer.Typer(
     help="Taiwan Index Futures Quant - V1 Backtest Lab CLI.",
@@ -72,7 +73,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 3 - Data Schemas and Storage.",
+        "Bootstrap complete. Next milestone: Task 5 - Bar Builder.",
         fg=typer.colors.GREEN,
     )
 
@@ -83,16 +84,36 @@ def import_taifex(
         Path,
         typer.Option(help="Directory containing raw files."),
     ] = Path("data/raw/taifex"),
+    processed_dir: Annotated[
+        Path,
+        typer.Option(help="Directory for processed output files."),
+    ] = Path("data/processed"),
     symbol: Annotated[
         str,
         typer.Option(help="Product symbol. V1 supports TMF only."),
     ] = "TMF",
 ) -> None:
-    """Import raw TAIFEX data. Placeholder until Task 4."""
-    _ = raw_dir
+    """Import raw TAIFEX CSV/ZIP files into cleaned tick Parquet files."""
     if symbol != "TMF":
         raise typer.BadParameter("V1 supports TMF only.")
-    _not_implemented("TAIFEX import", "Task 4 - TAIFEX Importer")
+    try:
+        summary = import_taifex_ticks(raw_dir, processed_dir, symbol=symbol)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"TAIFEX import failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho("TAIFEX import completed.", fg=typer.colors.GREEN)
+    typer.echo(f"Raw files discovered: {summary.files_discovered}")
+    typer.echo(f"CSV files read: {summary.csv_files_read}")
+    typer.echo(f"Input rows: {summary.input_row_count}")
+    typer.echo(f"Clean TMF ticks: {summary.output_tick_count}")
+    typer.echo(f"Invalid or filtered rows: {summary.invalid_row_count}")
+    if summary.output_paths:
+        typer.echo("Output files:")
+        for output_path in summary.output_paths:
+            typer.echo(f"  {output_path}")
+    else:
+        typer.echo("Output files: none")
 
 
 @app.command("build-bars")
