@@ -1,10 +1,13 @@
 """Command line interface for the V1 Backtest Lab."""
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 
 from tifq import __version__
+from tifq.config import ConfigLoadError, load_backtest_config
 
 app = typer.Typer(
     help="Taiwan Index Futures Quant - V1 Backtest Lab CLI.",
@@ -35,7 +38,7 @@ def _write_gitkeep(directory: Path) -> None:
 
 
 def _not_implemented(feature: str, task: str) -> None:
-    typer.secho(f"{feature} is planned for {task}; Task 1 only provides the bootstrap CLI.")
+    typer.secho(f"{feature} is planned for {task}; it is not implemented in the current task.")
     raise typer.Exit(code=1)
 
 
@@ -68,13 +71,22 @@ def init_project() -> None:
         status = "OK " if config_file.exists() else "MISS"
         typer.echo(f"  {status} {config_file}")
 
-    typer.secho("Bootstrap complete. Next milestone: Task 2 - Config System.", fg=typer.colors.GREEN)
+    typer.secho(
+        "Bootstrap complete. Next milestone: Task 2 - Config System.",
+        fg=typer.colors.GREEN,
+    )
 
 
 @app.command("import-taifex")
 def import_taifex(
-    raw_dir: Path = typer.Option(Path("data/raw/taifex"), help="Directory containing raw files."),
-    symbol: str = typer.Option("TMF", help="Product symbol. V1 supports TMF only."),
+    raw_dir: Annotated[
+        Path,
+        typer.Option(help="Directory containing raw files."),
+    ] = Path("data/raw/taifex"),
+    symbol: Annotated[
+        str,
+        typer.Option(help="Product symbol. V1 supports TMF only."),
+    ] = "TMF",
 ) -> None:
     """Import raw TAIFEX data. Placeholder until Task 4."""
     _ = raw_dir
@@ -85,8 +97,14 @@ def import_taifex(
 
 @app.command("build-bars")
 def build_bars(
-    symbol: str = typer.Option("TMF", help="Product symbol. V1 supports TMF only."),
-    timeframe: str = typer.Option("5m", help="Bar timeframe: 1m or 5m."),
+    symbol: Annotated[
+        str,
+        typer.Option(help="Product symbol. V1 supports TMF only."),
+    ] = "TMF",
+    timeframe: Annotated[
+        str,
+        typer.Option(help="Bar timeframe: 1m or 5m."),
+    ] = "5m",
 ) -> None:
     """Build OHLCV bars from cleaned ticks. Placeholder until Task 5."""
     if symbol != "TMF":
@@ -98,11 +116,26 @@ def build_bars(
 
 @app.command("backtest")
 def backtest(
-    config: Path = typer.Option(Path("configs/v1_backtest.yaml"), help="Path to YAML config."),
+    config: Annotated[
+        Path,
+        typer.Option(help="Path to YAML config."),
+    ] = Path("configs/v1_backtest.yaml"),
 ) -> None:
-    """Run a backtest from config. Placeholder until Task 8."""
-    _ = config
-    _not_implemented("Backtesting", "Task 8 - Backtest Engine")
+    """Validate a backtest config. Execution is planned for Task 8."""
+    try:
+        loaded_config = load_backtest_config(config)
+    except (ConfigLoadError, ValidationError) as exc:
+        typer.secho(f"Config validation failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho(f"Config validated successfully: {config}", fg=typer.colors.GREEN)
+    typer.echo(
+        "Validated scope: "
+        f"{loaded_config.data.symbol} {loaded_config.data.session} session, "
+        f"{loaded_config.data.timeframe} bars, "
+        f"{loaded_config.data.start_date} to {loaded_config.data.end_date}."
+    )
+    typer.secho("Backtesting execution is planned for Task 8 - Backtest Engine.")
 
 
 @app_group.command("backtest-lab")
@@ -113,4 +146,3 @@ def backtest_lab() -> None:
 
 if __name__ == "__main__":
     app()
-
