@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local market data and generated results
+data/raw/**
+!data/raw/
+!data/raw/taifex/
+!data/raw/taifex/.gitkeep
+
+data/processed/**
+!data/processed/
+!data/processed/ticks/
+!data/processed/ticks/.gitkeep
+!data/processed/bars/
+!data/processed/bars/.gitkeep
+
+data/results/**
+!data/results/
+!data/results/backtests/
+!data/results/backtests/.gitkeep
+
+logs/**
+!logs/
+!logs/.gitkeep
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

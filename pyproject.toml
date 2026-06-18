@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taiwan-index-futures-quant"
+version = "0.1.0"
+description = "Local research and backtesting lab for Taiwan Micro TAIEX Futures."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "polars",
+    "pyarrow",
+    "duckdb",
+    "pydantic",
+    "pyyaml",
+    "typer",
+    "streamlit",
+    "plotly",
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+tifq = "tifq.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

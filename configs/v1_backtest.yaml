@@ -1,0 +1,44 @@
+project:
+  name: Taiwan Index Futures Quant
+  timezone: Asia/Taipei
+
+data:
+  symbol: TMF
+  contract_mode: continuous_front_month
+  raw_dir: data/raw/taifex
+  processed_dir: data/processed
+  start_date: "2026-05-18"
+  end_date: "2026-06-17"
+  session: day
+  timeframe: 5m
+
+product:
+  point_value: 10
+  tick_size: 1
+  exchange: TAIFEX
+
+cost:
+  commission_per_side: 5
+  tax_rate: 0.00002
+  slippage_points_per_side: 1
+
+strategy:
+  name: vwap_trend
+  params:
+    ema_fast: 20
+    ema_slow: 60
+    atr_period: 14
+    atr_stop_mult: 1.5
+    take_profit_r: 1.5
+    min_atr_points: 10
+    max_atr_points: 120
+    max_trades_per_day: 3
+    force_flatten_time: "13:35:00"
+    no_entry_before: "08:55:00"
+    no_entry_after: "13:20:00"
+
+portfolio:
+  initial_cash: 100000
+  max_position: 1
+  allow_short: true
+

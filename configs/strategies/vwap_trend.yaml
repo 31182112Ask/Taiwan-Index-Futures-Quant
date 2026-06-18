@@ -1,0 +1,14 @@
+name: vwap_trend
+params:
+  ema_fast: 20
+  ema_slow: 60
+  atr_period: 14
+  atr_stop_mult: 1.5
+  take_profit_r: 1.5
+  min_atr_points: 10
+  max_atr_points: 120
+  max_trades_per_day: 3
+  force_flatten_time: "13:35:00"
+  no_entry_before: "08:55:00"
+  no_entry_after: "13:20:00"
+
