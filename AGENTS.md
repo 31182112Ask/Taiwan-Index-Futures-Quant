@@ -1207,3 +1207,29 @@ Historical backtest performance does not guarantee future results.
 Automated trading can cause real financial losses.
 
 No live trading functionality should be added until the project owner explicitly authorizes the relevant version and all previous stages are complete.
+
+---
+
+# 24. Future Replay and Professional Chart UI Requirements
+
+The project must eventually support a replayable K-line testing interface and a professional chart-like interface.
+
+Future interface requirements:
+
+* Monthly, weekly, daily, and intraday candlestick views.
+* Play, pause, fast-forward, slow-down, and step-forward historical replay.
+* Model indicator lines.
+* Forecast or expected-operation overlays.
+* Entry, exit, stop-loss, take-profit, and force-flatten markers.
+* Strategy state and reason display per bar.
+* Future live-mode compatibility through a shared event stream.
+
+Implementation rules:
+
+* Strategies must not draw directly on charts.
+* Indicators must not draw directly on charts.
+* Strategy and indicator modules should emit structured data only.
+* UI layers are responsible for rendering chart overlays.
+* Future chart rendering should consume structured bar, indicator, signal, model, and trade events.
+* A replay/chart event stream should be introduced before the final Backtest Lab UI.
+* Task 6 should only prepare indicator data; it must not implement replay or UI.

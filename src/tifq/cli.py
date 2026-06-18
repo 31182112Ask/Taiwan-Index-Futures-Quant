@@ -74,7 +74,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 6 - Indicators.",
+        "Bootstrap complete. Next milestone: Task 7 - Strategy Signals.",
         fg=typer.colors.GREEN,
     )
 
