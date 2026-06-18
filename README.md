@@ -50,9 +50,10 @@ Task 3 completed: data schemas and Parquet storage helpers.
 Task 4 completed: TAIFEX CSV/ZIP import and tick cleaning.
 Task 5 completed: tick Parquet to 1m/5m OHLCV bars.
 Task 6 completed: EMA, VWAP, ATR, and realized volatility indicators.
-Current next task: Task 7 - Strategy Signals.
+Task 7 completed: strategy interface and VWAP Trend signals.
+Current next task: Task 8 - Backtest Engine.
 
-The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
+The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Backtesting execution and Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 
@@ -67,4 +68,3 @@ tests/          unit and integration tests
 ## Safety
 
 This project is for quantitative research and software development only. Historical backtest results do not guarantee future performance. No live trading functionality belongs in V1.
-
