@@ -48,9 +48,10 @@ Task 1 completed: project bootstrap.
 Task 2 completed: config loading and validation.
 Task 3 completed: data schemas and Parquet storage helpers.
 Task 4 completed: TAIFEX CSV/ZIP import and tick cleaning.
-Current next task: Task 5 — Bar Builder.
+Task 5 completed: tick Parquet to 1m/5m OHLCV bars.
+Current next task: Task 6 — Indicators.
 
-The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
+The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Indicators, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 

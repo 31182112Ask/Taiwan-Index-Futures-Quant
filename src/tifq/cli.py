@@ -7,6 +7,7 @@ import typer
 from pydantic import ValidationError
 
 from tifq import __version__
+from tifq.bars import build_bar_files
 from tifq.config import ConfigLoadError, load_backtest_config
 from tifq.data import import_taifex_ticks
 
@@ -73,7 +74,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 5 - Bar Builder.",
+        "Bootstrap complete. Next milestone: Task 6 - Indicators.",
         fg=typer.colors.GREEN,
     )
 
@@ -126,13 +127,32 @@ def build_bars(
         str,
         typer.Option(help="Bar timeframe: 1m or 5m."),
     ] = "5m",
+    processed_dir: Annotated[
+        Path,
+        typer.Option(help="Directory containing processed tick data and bar outputs."),
+    ] = Path("data/processed"),
 ) -> None:
-    """Build OHLCV bars from cleaned ticks. Placeholder until Task 5."""
+    """Build OHLCV bars from cleaned tick Parquet files."""
     if symbol != "TMF":
         raise typer.BadParameter("V1 supports TMF only.")
     if timeframe not in {"1m", "5m"}:
         raise typer.BadParameter("V1 supports only 1m and 5m timeframes.")
-    _not_implemented("Bar building", "Task 5 - Bar Builder")
+    try:
+        summary = build_bar_files(processed_dir, symbol=symbol, timeframe=timeframe)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"Bar build failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho("Bar build completed.", fg=typer.colors.GREEN)
+    typer.echo(f"Tick files read: {summary.tick_files_read}")
+    typer.echo(f"Input ticks: {summary.input_tick_count}")
+    typer.echo(f"Output bars: {summary.output_bar_count}")
+    if summary.output_paths:
+        typer.echo("Output files:")
+        for output_path in summary.output_paths:
+            typer.echo(f"  {output_path}")
+    else:
+        typer.echo("Output files: none")
 
 
 @app.command("backtest")
