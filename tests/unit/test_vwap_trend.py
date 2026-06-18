@@ -131,6 +131,166 @@ def test_vwap_trend_force_flattens_open_position() -> None:
     assert signals.loc[2, "reason"] == "force_flatten"
 
 
+def test_vwap_trend_long_position_exits_on_stop_loss() -> None:
+    input_bars = bars(
+        [
+            {
+                "timestamp": "2026-06-17 09:00:00",
+                "symbol": "TMF",
+                "close": 99.0,
+                "ema_fast": 100.0,
+                "ema_slow": 98.0,
+                "vwap": 99.0,
+                "atr": 10.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:05:00",
+                "symbol": "TMF",
+                "close": 105.0,
+                "ema_fast": 102.0,
+                "ema_slow": 100.0,
+                "vwap": 101.0,
+                "atr": 10.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:10:00",
+                "symbol": "TMF",
+                "close": 90.0,
+                "ema_fast": 102.0,
+                "ema_slow": 100.0,
+                "vwap": 101.0,
+                "atr": 10.0,
+            },
+        ]
+    )
+
+    signals = strategy().generate_signals(input_bars)
+
+    assert signals.loc[2, "side"] == "FLAT"
+    assert signals.loc[2, "target_position"] == 0
+    assert signals.loc[2, "reason"] == "stop_loss"
+
+
+def test_vwap_trend_long_position_exits_on_take_profit() -> None:
+    input_bars = bars(
+        [
+            {
+                "timestamp": "2026-06-17 09:00:00",
+                "symbol": "TMF",
+                "close": 99.0,
+                "ema_fast": 100.0,
+                "ema_slow": 98.0,
+                "vwap": 99.0,
+                "atr": 10.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:05:00",
+                "symbol": "TMF",
+                "close": 105.0,
+                "ema_fast": 102.0,
+                "ema_slow": 100.0,
+                "vwap": 101.0,
+                "atr": 10.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:10:00",
+                "symbol": "TMF",
+                "close": 128.0,
+                "ema_fast": 102.0,
+                "ema_slow": 100.0,
+                "vwap": 101.0,
+                "atr": 10.0,
+            },
+        ]
+    )
+
+    signals = strategy().generate_signals(input_bars)
+
+    assert signals.loc[2, "side"] == "FLAT"
+    assert signals.loc[2, "target_position"] == 0
+    assert signals.loc[2, "reason"] == "take_profit"
+
+
+def test_vwap_trend_short_position_exits_on_stop_loss() -> None:
+    input_bars = bars(
+        [
+            {
+                "timestamp": "2026-06-17 09:00:00",
+                "symbol": "TMF",
+                "close": 105.0,
+                "ema_fast": 104.0,
+                "ema_slow": 106.0,
+                "vwap": 105.0,
+                "atr": 8.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:05:00",
+                "symbol": "TMF",
+                "close": 99.0,
+                "ema_fast": 101.0,
+                "ema_slow": 103.0,
+                "vwap": 102.0,
+                "atr": 8.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:10:00",
+                "symbol": "TMF",
+                "close": 111.0,
+                "ema_fast": 101.0,
+                "ema_slow": 103.0,
+                "vwap": 102.0,
+                "atr": 8.0,
+            },
+        ]
+    )
+
+    signals = strategy().generate_signals(input_bars)
+
+    assert signals.loc[2, "side"] == "FLAT"
+    assert signals.loc[2, "target_position"] == 0
+    assert signals.loc[2, "reason"] == "stop_loss"
+
+
+def test_vwap_trend_short_position_exits_on_take_profit() -> None:
+    input_bars = bars(
+        [
+            {
+                "timestamp": "2026-06-17 09:00:00",
+                "symbol": "TMF",
+                "close": 105.0,
+                "ema_fast": 104.0,
+                "ema_slow": 106.0,
+                "vwap": 105.0,
+                "atr": 8.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:05:00",
+                "symbol": "TMF",
+                "close": 99.0,
+                "ema_fast": 101.0,
+                "ema_slow": 103.0,
+                "vwap": 102.0,
+                "atr": 8.0,
+            },
+            {
+                "timestamp": "2026-06-17 09:10:00",
+                "symbol": "TMF",
+                "close": 81.0,
+                "ema_fast": 101.0,
+                "ema_slow": 103.0,
+                "vwap": 102.0,
+                "atr": 8.0,
+            },
+        ]
+    )
+
+    signals = strategy().generate_signals(input_bars)
+
+    assert signals.loc[2, "side"] == "FLAT"
+    assert signals.loc[2, "target_position"] == 0
+    assert signals.loc[2, "reason"] == "take_profit"
+
+
 def test_vwap_trend_exits_on_reverse_signal() -> None:
     input_bars = bars(
         [
@@ -236,4 +396,3 @@ def test_vwap_trend_rejects_missing_indicator_columns() -> None:
 
     with pytest.raises(ValueError, match="missing required columns"):
         strategy().generate_signals(input_bars)
-
