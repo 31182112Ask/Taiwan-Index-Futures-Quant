@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from tifq.backtest.cost import CostModel
+from tifq.backtest.metrics import calculate_metrics
 from tifq.backtest.portfolio import Portfolio, PositionSide
 from tifq.config.models import BacktestConfig
 from tifq.data.schemas import V1_SYMBOL, validate_bar_frame
@@ -103,7 +104,7 @@ class BacktestEngine:
 
         trades = portfolio.trades_frame()
         equity_curve = pd.DataFrame(equity_rows)
-        metrics = _basic_metrics(self.initial_cash, trades, equity_curve)
+        metrics = calculate_metrics(self.initial_cash, trades, equity_curve)
         return BacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
 
     def _execute_signal(
@@ -255,36 +256,6 @@ def _equity_row(
         "position": portfolio.current_position,
         "close": close_price,
         "equity": equity,
-    }
-
-
-def _basic_metrics(
-    initial_cash: float,
-    trades: pd.DataFrame,
-    equity_curve: pd.DataFrame,
-) -> dict[str, float | int]:
-    final_equity = (
-        float(equity_curve.iloc[-1]["equity"]) if not equity_curve.empty else initial_cash
-    )
-    if trades.empty:
-        total_fee = 0.0
-        total_tax = 0.0
-        total_slippage = 0.0
-        trade_count = 0
-    else:
-        total_fee = float(trades["fee"].sum())
-        total_tax = float(trades["tax"].sum())
-        total_slippage = float(trades["slippage"].sum())
-        trade_count = len(trades)
-    return {
-        "initial_cash": float(initial_cash),
-        "final_equity": final_equity,
-        "net_pnl": final_equity - initial_cash,
-        "return_pct": (final_equity - initial_cash) / initial_cash,
-        "trade_count": trade_count,
-        "total_fee": total_fee,
-        "total_tax": total_tax,
-        "total_slippage": total_slippage,
     }
 
 

@@ -7,7 +7,7 @@ import typer
 from pydantic import ValidationError
 
 from tifq import __version__
-from tifq.backtest import run_backtest_from_config
+from tifq.backtest import persist_backtest_result, run_backtest_from_config
 from tifq.bars import build_bar_files
 from tifq.config import ConfigLoadError, load_backtest_config
 from tifq.data import import_taifex_ticks
@@ -75,7 +75,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 9 - Metrics and Reports.",
+        "Bootstrap complete. Next milestone: Task 10 - Streamlit Backtest Lab.",
         fg=typer.colors.GREEN,
     )
 
@@ -171,6 +171,7 @@ def backtest(
         raise typer.Exit(code=1) from exc
     try:
         result = run_backtest_from_config(loaded_config)
+        report_paths = persist_backtest_result(loaded_config, result)
     except (OSError, ValueError) as exc:
         typer.secho(f"Backtest failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -189,7 +190,13 @@ def backtest(
     typer.echo(f"Trades: {result.metrics['trade_count']}")
     typer.echo(f"Final equity: {result.metrics['final_equity']:.2f}")
     typer.echo(f"Net PnL: {result.metrics['net_pnl']:.2f}")
-    typer.echo("Persisted reports are planned for Task 9 - Metrics and Reports.")
+    typer.echo(f"Max drawdown: {result.metrics['max_drawdown']:.2f}")
+    typer.echo(f"Win rate: {result.metrics['win_rate']:.2%}")
+    typer.echo(f"Result directory: {report_paths.run_dir}")
+    typer.echo(f"  {report_paths.config_path}")
+    typer.echo(f"  {report_paths.trades_path}")
+    typer.echo(f"  {report_paths.equity_curve_path}")
+    typer.echo(f"  {report_paths.metrics_path}")
 
 
 @app_group.command("backtest-lab")
