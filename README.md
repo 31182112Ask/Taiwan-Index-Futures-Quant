@@ -27,7 +27,7 @@ python -m venv .venv
 python -m pip install -e .[dev]
 ```
 
-If dependencies are already installed and you only need the CLI entry point during bootstrap:
+If dependencies are already installed and you only need the CLI entry point:
 
 ```bash
 python -m pip install -e . --no-deps
@@ -44,7 +44,11 @@ tifq backtest --config configs/v1_backtest.yaml
 tifq app backtest-lab
 ```
 
-At Task 1, only the project skeleton and CLI placeholders are implemented. Data import, bar generation, strategy logic, backtesting, and Streamlit UI are implemented in later tasks.
+Task 1 completed: project bootstrap.
+Task 2 completed: config loading and validation.
+Current next task: Task 3 — Data Schemas and Storage.
+
+The `backtest` command currently validates `configs/v1_backtest.yaml` and then stops before execution. Data import, bar generation, strategy logic, backtesting execution, and Streamlit UI are implemented in later tasks.
 
 ## Project Layout
 
@@ -59,4 +63,3 @@ tests/          unit and integration tests
 ## Safety
 
 This project is for quantitative research and software development only. Historical backtest results do not guarantee future performance. No live trading functionality belongs in V1.
-
