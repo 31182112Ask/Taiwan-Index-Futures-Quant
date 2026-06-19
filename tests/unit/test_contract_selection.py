@@ -74,6 +74,8 @@ def test_continuous_contract_rolls_only_after_confirmation() -> None:
             ("2026-06-18 08:45", "202607", 201, 30),
             ("2026-06-19 08:45", "202606", 102, 20),
             ("2026-06-19 08:45", "202607", 202, 40),
+            ("2026-06-22 08:45", "202606", 103, 20),
+            ("2026-06-22 08:45", "202607", 203, 40),
         ]
     )
 
@@ -83,9 +85,10 @@ def test_continuous_contract_rolls_only_after_confirmation() -> None:
         roll_confirmation_days=2,
     )
 
-    assert result.bars["contract"].tolist() == ["202606", "202606", "202607"]
-    assert result.audit["rolled"].tolist() == [False, False, True]
+    assert result.bars["contract"].tolist() == ["202606", "202606", "202606", "202607"]
+    assert result.audit["rolled"].tolist() == [False, False, False, True]
     assert result.audit["contract_segment_id"].tolist() == [
+        "segment_001",
         "segment_001",
         "segment_001",
         "segment_002",
@@ -131,6 +134,77 @@ def test_future_day_volume_does_not_change_past_selection() -> None:
     full = select_contract_bars(with_future, contract_mode="continuous_front_month")
 
     assert truncated.audit.loc[0, "selected_contract"] == full.audit.loc[0, "selected_contract"]
+
+
+def test_current_day_volume_cannot_change_same_day_selection() -> None:
+    frame = bars(
+        [
+            ("2026-06-17 08:45", "202606", 100, 100),
+            ("2026-06-17 08:45", "202607", 200, 10),
+            ("2026-06-18 08:45", "202606", 101, 1),
+            ("2026-06-18 08:45", "202607", 201, 10_000),
+        ]
+    )
+
+    result = select_contract_bars(frame, contract_mode="continuous_front_month")
+
+    assert result.audit["selected_contract"].tolist() == ["202606", "202606"]
+
+
+def test_previous_day_volume_can_roll_next_trading_day() -> None:
+    frame = bars(
+        [
+            ("2026-06-17 08:45", "202606", 100, 100),
+            ("2026-06-17 08:45", "202607", 200, 10),
+            ("2026-06-18 08:45", "202606", 101, 10),
+            ("2026-06-18 08:45", "202607", 201, 100),
+            ("2026-06-19 08:45", "202606", 102, 10),
+            ("2026-06-19 08:45", "202607", 202, 100),
+        ]
+    )
+
+    result = select_contract_bars(frame, contract_mode="continuous_front_month")
+
+    assert result.audit["selected_contract"].tolist() == ["202606", "202606", "202607"]
+    assert result.audit.loc[2, "decision_source_date"] == pd.Timestamp("2026-06-18").date()
+    assert result.audit.loc[2, "roll_effective_date"] == pd.Timestamp("2026-06-19").date()
+
+
+def test_confirmation_is_based_only_on_completed_days() -> None:
+    frame = bars(
+        [
+            ("2026-06-17 08:45", "202606", 100, 10),
+            ("2026-06-17 08:45", "202607", 200, 100),
+            ("2026-06-18 08:45", "202606", 101, 10),
+            ("2026-06-18 08:45", "202607", 201, 100),
+            ("2026-06-19 08:45", "202606", 102, 10),
+            ("2026-06-19 08:45", "202607", 202, 100),
+        ]
+    )
+
+    result = select_contract_bars(
+        frame, contract_mode="continuous_front_month", roll_confirmation_days=2
+    )
+
+    assert result.audit["selected_contract"].tolist() == ["202606", "202606", "202607"]
+    assert result.audit.loc[1, "confirmation_count"] == 1
+    assert result.audit.loc[2, "confirmation_count"] == 2
+
+
+def test_roll_effective_date_is_after_decision_date() -> None:
+    frame = bars(
+        [
+            ("2026-06-17 08:45", "202606", 100, 10),
+            ("2026-06-17 08:45", "202607", 200, 100),
+            ("2026-06-18 08:45", "202606", 101, 10),
+            ("2026-06-18 08:45", "202607", 201, 100),
+        ]
+    )
+
+    result = select_contract_bars(frame, contract_mode="continuous_front_month")
+    rolled = result.audit.loc[result.audit["rolled"]].iloc[0]
+
+    assert rolled["roll_effective_date"] > rolled["decision_source_date"]
 
 
 def test_invalid_contract_is_reported_and_not_mixed() -> None:

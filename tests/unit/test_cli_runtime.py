@@ -101,3 +101,33 @@ def test_sync_plan_does_not_call_download(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "TAIFEX download plan" in result.stdout
     assert not (tmp_path / "raw").exists()
+
+
+def test_workflow_help_lists_stop_and_machine_readable_options() -> None:
+    result = runner.invoke(app, ["workflow", "--help"])
+
+    assert result.exit_code == 0
+    assert "--stop-after" in result.stdout
+    assert "--quiet" in result.stdout
+    assert "--json" in result.stdout
+
+
+def test_workflow_can_stop_after_doctor_with_json(tmp_path: Path, monkeypatch) -> None:
+    config_path = Path(__file__).parents[2] / "configs" / "v1_backtest.yaml"
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "--config",
+            str(config_path),
+            "--stop-after",
+            "doctor",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"step": "doctor"' in result.stdout
+    assert '"status": "complete"' in result.stdout

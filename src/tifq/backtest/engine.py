@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -38,6 +39,18 @@ class BacktestResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
     data_fingerprint: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BacktestPreflight:
+    """Prepared immutable-by-convention model inputs bound to a data fingerprint."""
+
+    model_bars: pd.DataFrame
+    signals: pd.DataFrame
+    contract_selection: pd.DataFrame
+    diagnostics: dict[str, Any]
+    timings: dict[str, float]
+    data_fingerprint: dict[str, Any]
 
 
 class BacktestEngine:
@@ -88,10 +101,7 @@ class BacktestEngine:
         working_signals = _prepare_signals(signals)
         if len(working_bars) != len(working_signals):
             raise ValueError("bars and signals must have the same number of rows")
-        if not pd.to_datetime(working_bars["timestamp"]).equals(
-            pd.to_datetime(working_signals["timestamp"])
-        ):
-            raise ValueError("bars and signals timestamps must align exactly")
+        _validate_bar_signal_alignment(working_bars, working_signals)
         self.rejection_counts = {}
 
         portfolio = Portfolio(self.initial_cash)
@@ -102,7 +112,24 @@ class BacktestEngine:
             timestamp = pd.Timestamp(bar["timestamp"])
             if index > 0:
                 signal = working_signals.iloc[index - 1]
-                self._execute_signal(portfolio, signal, bar, trade_counts)
+                previous_bar = working_bars.iloc[index - 1]
+                if _segment_identity(previous_bar) != _segment_identity(bar):
+                    if portfolio.current_position != 0:
+                        portfolio.close(
+                            timestamp=pd.Timestamp(previous_bar["timestamp"]),
+                            raw_price=float(previous_bar["close"]),
+                            cost_model=self.cost_model,
+                            reason="contract_roll",
+                        )
+                        equity_rows[-1] = _equity_row(
+                            portfolio,
+                            pd.Timestamp(previous_bar["timestamp"]),
+                            float(previous_bar["close"]),
+                            self.cost_model.point_value,
+                        )
+                    self._record_rejection("segment_boundary")
+                else:
+                    self._execute_signal(portfolio, signal, bar, trade_counts)
             equity_rows.append(
                 _equity_row(portfolio, timestamp, float(bar["close"]), self.cost_model.point_value)
             )
@@ -191,19 +218,64 @@ class BacktestEngine:
 def run_backtest_from_config(
     config: BacktestConfig,
     *,
+    preflight: BacktestPreflight | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> BacktestResult:
-    """Load configured bars, calculate indicators, run strategy, and execute signals."""
+    """Execute a prepared or freshly calculated conservative backtest."""
     if config.strategy.name != "vwap_trend":
         raise ValueError("Task 8 supports the vwap_trend strategy only")
 
     reporter = ProgressReporter("backtest", progress_callback)
+    if preflight is None:
+        prepared = prepare_backtest(config, progress_callback=progress_callback)
+        reused = False
+    else:
+        current_fingerprint = build_data_fingerprint(config)
+        if preflight.data_fingerprint != current_fingerprint:
+            raise ValueError("Preflight result is stale; run preflight again before backtest")
+        prepared = preflight
+        reused = True
+    timings = dict(prepared.timings)
+    timings["preflight_reused"] = float(reused)
+    diagnostics = deepcopy(prepared.diagnostics)
+    reporter.update("Execute backtest", 0, 1, "Executing next-bar-open simulation")
+    started = perf_counter()
+    execution = BacktestEngine.from_config(config).run(prepared.model_bars, prepared.signals)
+    timings["backtest_execution"] = perf_counter() - started
+    diagnostics["execution_rejections"] = execution.diagnostics.get("execution_rejections", {})
+    if execution.metrics.get("trade_count", 0) == 0 and diagnostics["execution_rejections"].get(
+        "insufficient_assumed_margin", 0
+    ):
+        diagnostics["primary_zero_trade_reason"] = "assumed margin insufficient"
+    reporter.update("Complete", 1, 1, "Backtest complete")
+    return BacktestResult(
+        trades=execution.trades,
+        equity_curve=execution.equity_curve,
+        metrics=execution.metrics,
+        model_bars=prepared.model_bars,
+        signals=prepared.signals,
+        contract_selection=prepared.contract_selection,
+        diagnostics=diagnostics,
+        timings=timings,
+        data_fingerprint=prepared.data_fingerprint,
+    )
+
+
+def prepare_backtest(
+    config: BacktestConfig,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> BacktestPreflight:
+    """Load, select, enrich, and diagnose bars without executing trades."""
+    if config.strategy.name != "vwap_trend":
+        raise ValueError("V1 supports the vwap_trend strategy only")
+    reporter = ProgressReporter("backtest_preflight", progress_callback)
     timings: dict[str, float] = {}
-    reporter.update("Preflight", 0, 6, "Loading configured bars")
+    reporter.update("Load bars", 0, 4, "Loading configured bars")
     started = perf_counter()
     bars = load_configured_bars(config)
     timings["bar_loading"] = perf_counter() - started
-    reporter.update("Select contracts", 1, 6, "Selecting active TMF contracts")
+    reporter.update("Select contracts", 1, 4, "Selecting active TMF contracts")
     started = perf_counter()
     selection = select_contract_bars(
         bars,
@@ -213,7 +285,7 @@ def run_backtest_from_config(
     )
     timings["contract_selection"] = perf_counter() - started
     params: dict[str, object] = dict(config.strategy.params)
-    reporter.update("Calculate indicators", 2, 6, "Calculating segment-safe indicators")
+    reporter.update("Calculate indicators", 2, 4, "Calculating segment-safe indicators")
     started = perf_counter()
     enriched_bars = append_basic_indicators(
         selection.bars,
@@ -223,39 +295,25 @@ def run_backtest_from_config(
         volatility_window=_int_param(params, "volatility_window", 20),
     )
     timings["indicator_calculation"] = perf_counter() - started
-    reporter.update("Generate signals", 3, 6, "Generating VWAP Trend signals")
+    reporter.update("Generate signals", 3, 4, "Generating and aligning strategy signals")
     started = perf_counter()
-    strategy = VWAPTrendStrategy.from_config_params(params)
-    signals = strategy.generate_signals(enriched_bars)
+    signals = VWAPTrendStrategy.from_config_params(params).generate_signals(enriched_bars)
     signals["contract"] = enriched_bars["contract"].to_numpy()
     signals["contract_segment_id"] = enriched_bars["contract_segment_id"].to_numpy()
+    _validate_bar_signal_alignment(_prepare_bars(enriched_bars), _prepare_signals(signals))
     timings["signal_generation"] = perf_counter() - started
     diagnostics = build_backtest_diagnostics(bars, selection, enriched_bars, signals, config)
     if diagnostics["errors"]:
         raise ValueError("Backtest preflight failed: " + "; ".join(diagnostics["errors"]))
-    reporter.update("Execute backtest", 4, 6, "Executing next-bar-open simulation")
-    started = perf_counter()
-    execution = BacktestEngine.from_config(config).run(enriched_bars, signals)
-    timings["backtest_execution"] = perf_counter() - started
-    diagnostics["execution_rejections"] = execution.diagnostics.get(
-        "execution_rejections", {}
-    )
-    if (
-        execution.metrics.get("trade_count", 0) == 0
-        and diagnostics["execution_rejections"].get("insufficient_assumed_margin", 0)
-    ):
-        diagnostics["primary_zero_trade_reason"] = "assumed margin insufficient"
-    reporter.update("Complete", 6, 6, "Backtest complete")
-    return BacktestResult(
-        trades=execution.trades,
-        equity_curve=execution.equity_curve,
-        metrics=execution.metrics,
+    fingerprint = build_data_fingerprint(config)
+    reporter.update("Complete", 4, 4, "Backtest preflight complete")
+    return BacktestPreflight(
         model_bars=enriched_bars,
         signals=signals,
         contract_selection=selection.audit,
         diagnostics=diagnostics,
         timings=timings,
-        data_fingerprint=_data_fingerprint(config),
+        data_fingerprint=fingerprint,
     )
 
 
@@ -319,6 +377,7 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
     if bars.empty:
         raise ValueError("bars must not be empty")
     prepared = bars.copy().sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    _require_identity_columns(prepared, "bars")
     if pd.to_datetime(prepared["timestamp"]).duplicated().any():
         raise ValueError("bars contain duplicate active timestamps")
     return prepared
@@ -328,7 +387,38 @@ def _prepare_signals(signals: pd.DataFrame) -> pd.DataFrame:
     validate_signal_frame(signals)
     if signals.empty:
         raise ValueError("signals must not be empty")
-    return signals.copy().sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    prepared = signals.copy().sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    _require_identity_columns(prepared, "signals")
+    return prepared
+
+
+IDENTITY_COLUMNS = ("timestamp", "symbol", "contract", "contract_segment_id")
+
+
+def _require_identity_columns(frame: pd.DataFrame, frame_name: str) -> None:
+    missing = [column for column in IDENTITY_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError(f"{frame_name} missing identity columns: {', '.join(missing)}")
+
+
+def _validate_bar_signal_alignment(bars: pd.DataFrame, signals: pd.DataFrame) -> None:
+    for column in IDENTITY_COLUMNS:
+        bar_values = bars[column]
+        signal_values = signals[column]
+        if column == "timestamp":
+            aligned = pd.to_datetime(bar_values).equals(pd.to_datetime(signal_values))
+        else:
+            aligned = bar_values.astype(str).equals(signal_values.astype(str))
+        if not aligned:
+            raise ValueError(f"bars and signals {column} must align exactly")
+
+
+def _segment_identity(row: pd.Series) -> tuple[str, str, str]:
+    return (
+        str(row["symbol"]),
+        str(row["contract"]),
+        str(row["contract_segment_id"]),
+    )
 
 
 def _equity_row(
@@ -362,7 +452,7 @@ def _optional_int(value: object) -> int | None:
     raise ValueError(f"max_trades_per_day must be an integer; got: {value}")
 
 
-def _data_fingerprint(config: BacktestConfig) -> dict[str, Any]:
+def build_data_fingerprint(config: BacktestConfig) -> dict[str, Any]:
     paths = discover_bar_files(
         config.data.processed_dir,
         symbol=config.data.symbol,
@@ -370,9 +460,25 @@ def _data_fingerprint(config: BacktestConfig) -> dict[str, Any]:
         start_date=config.data.start_date,
         end_date=config.data.end_date,
     )
+    manifest_path = config.data.processed_dir / "bar_manifest.json"
+    manifest_stat = manifest_path.stat() if manifest_path.exists() else None
     return {
+        "config_json": config.model_dump_json(),
         "source_bar_paths": [str(path.resolve()) for path in paths],
         "source_hashes": {str(path.resolve()): sha256_file(path) for path in paths},
+        "source_metadata": {
+            str(path.resolve()): {
+                "size": path.stat().st_size,
+                "mtime_ns": path.stat().st_mtime_ns,
+            }
+            for path in paths
+        },
+        "bar_manifest": {
+            "path": str(manifest_path.resolve()),
+            "size": manifest_stat.st_size if manifest_stat else None,
+            "mtime_ns": manifest_stat.st_mtime_ns if manifest_stat else None,
+            "sha256": sha256_file(manifest_path) if manifest_stat else None,
+        },
         "contract_mode": config.data.contract_mode,
         "selected_contract": config.data.contract,
         "indicator_params": {

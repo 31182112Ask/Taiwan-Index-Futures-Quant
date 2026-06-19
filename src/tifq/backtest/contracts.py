@@ -29,6 +29,11 @@ AUDIT_COLUMNS = (
     "next_volume",
     "rolled",
     "contract_segment_id",
+    "decision_source_date",
+    "decision_current_volume",
+    "decision_next_volume",
+    "confirmation_count",
+    "roll_effective_date",
 )
 
 
@@ -146,6 +151,12 @@ def _select_continuous(
     audit_rows: list[dict[str, object]] = []
     current: str | None = None
     confirmation_count = 0
+    confirmation_candidate: str | None = None
+    pending_roll: str | None = None
+    previous_date: date | None = None
+    previous_current_volume = 0.0
+    previous_next_volume = 0.0
+    previous_confirmation_count = 0
     segment = 1
     for index, trading_day in enumerate(trading_days, start=1):
         day = bars.loc[bars["trading_date"] == trading_day]
@@ -153,13 +164,27 @@ def _select_continuous(
         available = sorted(str(value) for value in volumes)
         rolled = False
         next_contract: str | None = None
-        next_volume = 0.0
-        current_volume = 0.0
         reason: SelectionReason
+        decision_source_date = previous_date
+        roll_effective_date: date | None = None
 
         if current is None:
             current = _initial_front_month(available, trading_day)
             reason = "initial_front_month"
+        elif pending_roll is not None:
+            candidates = [candidate for candidate in available if candidate >= pending_roll]
+            if not candidates:
+                raise ValueError(
+                    f"No contract available for confirmed roll after {current} on {trading_day}"
+                )
+            current = candidates[0]
+            segment += 1
+            rolled = True
+            roll_effective_date = trading_day
+            reason = "confirmed_volume_roll"
+            pending_roll = None
+            confirmation_count = 0
+            confirmation_candidate = None
         elif current not in volumes:
             later = [candidate for candidate in available if candidate > current]
             if not later:
@@ -169,25 +194,12 @@ def _select_continuous(
             current = later[0]
             segment += 1
             rolled = True
+            roll_effective_date = trading_day
             confirmation_count = 0
+            confirmation_candidate = None
             reason = "current_contract_missing"
         else:
-            current_volume = float(volumes[current])
-            later = [candidate for candidate in available if candidate > current]
-            next_contract = later[0] if later else None
-            next_volume = float(volumes.get(next_contract, 0.0)) if next_contract else 0.0
-            if next_contract is not None and next_volume > current_volume:
-                confirmation_count += 1
-            else:
-                confirmation_count = 0
-            if next_contract is not None and confirmation_count >= confirmation_days:
-                current = next_contract
-                segment += 1
-                rolled = True
-                confirmation_count = 0
-                reason = "confirmed_volume_roll"
-            else:
-                reason = "kept_current"
+            reason = "kept_current"
 
         segment_id = f"segment_{segment:03d}"
         selected_day = day.loc[day["contract"] == current].copy()
@@ -195,18 +207,43 @@ def _select_continuous(
             raise ValueError(f"Selected contract {current} has no bars on {trading_day}")
         selected_day["contract_segment_id"] = segment_id
         selected_frames.append(selected_day)
+        later = [candidate for candidate in available if candidate > current]
+        next_contract = later[0] if later else None
+        current_volume = float(volumes.get(current, 0.0))
+        next_volume = float(volumes.get(next_contract, 0.0)) if next_contract else 0.0
         audit_rows.append(
             _audit_row(
                 trading_day,
                 current,
                 reason,
-                current_volume or float(volumes.get(current, 0.0)),
+                current_volume,
                 next_contract,
                 next_volume,
                 rolled,
                 segment_id,
+                decision_source_date,
+                previous_current_volume,
+                previous_next_volume,
+                previous_confirmation_count,
+                roll_effective_date,
             )
         )
+        if next_contract is not None and next_volume > current_volume:
+            if confirmation_candidate == next_contract:
+                confirmation_count += 1
+            else:
+                confirmation_candidate = next_contract
+                confirmation_count = 1
+            if confirmation_count >= confirmation_days:
+                pending_roll = next_contract
+        else:
+            confirmation_count = 0
+            confirmation_candidate = None
+            pending_roll = None
+        previous_date = trading_day
+        previous_current_volume = current_volume
+        previous_next_volume = next_volume
+        previous_confirmation_count = confirmation_count
         reporter.update("Select contracts", index, len(trading_days), str(trading_day))
     return ContractSelectionResult(
         _finalize_selected(pd.concat(selected_frames, ignore_index=True)),
@@ -225,8 +262,10 @@ def _initial_front_month(contracts: list[str], trading_day: date) -> str:
 
 
 def _finalize_selected(bars: pd.DataFrame) -> pd.DataFrame:
-    return bars.drop(columns="trading_date").sort_values("timestamp", kind="mergesort").reset_index(
-        drop=True
+    return (
+        bars.drop(columns="trading_date")
+        .sort_values("timestamp", kind="mergesort")
+        .reset_index(drop=True)
     )
 
 
@@ -238,9 +277,9 @@ def _validate_selected_sequence(bars: pd.DataFrame) -> None:
         raise ValueError("contract selection produced duplicate active timestamps")
     if not timestamps.is_monotonic_increasing:
         raise ValueError("contract selection timestamps must be monotonically increasing")
-    daily_contracts = bars.assign(trading_date=timestamps.dt.date).groupby("trading_date")[
-        "contract"
-    ].nunique()
+    daily_contracts = (
+        bars.assign(trading_date=timestamps.dt.date).groupby("trading_date")["contract"].nunique()
+    )
     if (daily_contracts > 1).any():
         raise ValueError("contract selection produced multiple active contracts in one day")
 
@@ -254,6 +293,11 @@ def _audit_row(
     next_volume: float,
     rolled: bool,
     segment_id: str,
+    decision_source_date: date | None = None,
+    decision_current_volume: float = 0.0,
+    decision_next_volume: float = 0.0,
+    confirmation_count: int = 0,
+    roll_effective_date: date | None = None,
 ) -> dict[str, object]:
     return {
         "trading_date": trading_day,
@@ -264,4 +308,9 @@ def _audit_row(
         "next_volume": next_volume,
         "rolled": rolled,
         "contract_segment_id": segment_id,
+        "decision_source_date": decision_source_date,
+        "decision_current_volume": decision_current_volume,
+        "decision_next_volume": decision_next_volume,
+        "confirmation_count": confirmation_count,
+        "roll_effective_date": roll_effective_date,
     }

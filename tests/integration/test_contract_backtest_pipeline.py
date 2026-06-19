@@ -4,8 +4,14 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from tifq.backtest import BacktestEngine, CostModel, run_backtest_from_config
+from tifq.backtest import (
+    BacktestEngine,
+    CostModel,
+    prepare_backtest,
+    run_backtest_from_config,
+)
 from tifq.config.models import BacktestConfig
 from tifq.data.storage import bar_path, write_parquet
 
@@ -112,9 +118,12 @@ def test_zero_trade_diagnostics_identifies_atr_above_maximum(tmp_path: Path) -> 
 
 
 def test_assumed_margin_blocks_entry_and_records_reason() -> None:
-    bars = multi_contract_bars().loc[
-        lambda frame: frame["contract"] == "202606"
-    ].head(3).reset_index(drop=True)
+    bars = (
+        multi_contract_bars()
+        .loc[lambda frame: frame["contract"] == "202606"]
+        .head(3)
+        .reset_index(drop=True)
+    )
     signals = pd.DataFrame(
         {
             "timestamp": bars["timestamp"],
@@ -126,6 +135,9 @@ def test_assumed_margin_blocks_entry_and_records_reason() -> None:
             "take_profit": [None, None, None],
         }
     )
+    signals["contract"] = bars["contract"].to_numpy()
+    signals["contract_segment_id"] = "segment_001"
+    bars["contract_segment_id"] = "segment_001"
     engine = BacktestEngine(
         initial_cash=1_000,
         cost_model=CostModel(point_value=10),
@@ -135,6 +147,30 @@ def test_assumed_margin_blocks_entry_and_records_reason() -> None:
     result = engine.run(bars, signals)
 
     assert result.metrics["trade_count"] == 0
-    assert result.diagnostics["execution_rejections"] == {
-        "insufficient_assumed_margin": 2
-    }
+    assert result.diagnostics["execution_rejections"] == {"insufficient_assumed_margin": 2}
+
+
+def test_preflight_fingerprint_change_is_rejected(tmp_path: Path) -> None:
+    selected_config = config(tmp_path)
+    source = bar_path(selected_config.data.processed_dir, "TMF", "5m", date(2026, 6, 17))
+    bars = multi_contract_bars()
+    write_parquet(bars, source)
+    prepared = prepare_backtest(selected_config)
+    bars.loc[0, "close"] += 1
+    write_parquet(bars, source)
+
+    with pytest.raises(ValueError, match="stale"):
+        run_backtest_from_config(selected_config, preflight=prepared)
+
+
+def test_matching_preflight_is_reused(tmp_path: Path) -> None:
+    selected_config = config(tmp_path)
+    write_parquet(
+        multi_contract_bars(),
+        bar_path(selected_config.data.processed_dir, "TMF", "5m", date(2026, 6, 17)),
+    )
+    prepared = prepare_backtest(selected_config)
+
+    result = run_backtest_from_config(selected_config, preflight=prepared)
+
+    assert result.timings["preflight_reused"] == 1.0

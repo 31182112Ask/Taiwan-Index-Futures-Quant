@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from bs4 import BeautifulSoup
 
-from tifq.runtime.locking import OperationLock
+from tifq.runtime.locking import PipelineOperationLock
 from tifq.runtime.progress import ProgressCallback, ProgressReporter
 
 TAIFEX_RECENT_FUTURES_URL = "https://www.taifex.com.tw/cht/3/dlFutPrevious30DaysSalesData"
@@ -255,7 +255,7 @@ def sync_recent_taifex_csv_files(
     raw_path = Path(raw_dir)
     raw_path.mkdir(parents=True, exist_ok=True)
     lock_dir = raw_path.parent.parent / ".runtime"
-    with OperationLock(lock_dir, "taifex_sync"):
+    with PipelineOperationLock(lock_dir, "taifex_sync"):
         manifest = _load_manifest(raw_path)
         records_by_key = _manifest_records_by_key(manifest)
         owns_client = client is None

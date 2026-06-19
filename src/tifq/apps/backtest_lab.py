@@ -15,12 +15,14 @@ import pandas as pd
 import yaml
 
 from tifq.backtest import (
+    BacktestPreflight,
     BacktestResult,
     persist_backtest_result,
+    prepare_backtest,
     run_backtest_from_config,
 )
 from tifq.backtest.contracts import select_contract_bars
-from tifq.backtest.engine import discover_bar_files, load_configured_bars
+from tifq.backtest.engine import load_configured_bars
 from tifq.backtest.metrics import MetricValue
 from tifq.bars import build_bar_files, discover_tick_files
 from tifq.config import ConfigLoadError, load_backtest_config
@@ -31,6 +33,7 @@ from tifq.data.taifex_fetcher import (
     TaifexDownloadPlan,
     TaifexFetchError,
     TaifexFetchSummary,
+    build_taifex_download_plan,
     plan_recent_taifex_csv_files,
     sync_recent_taifex_csv_files,
 )
@@ -43,7 +46,13 @@ from tifq.runtime import (
     run_environment_health_check,
 )
 from tifq.runtime.cleanup import CleanupAction
+from tifq.runtime.locking import OperationLockError, format_lock_conflict
 from tifq.runtime.progress import ProgressUpdate
+from tifq.workflow import (
+    WorkflowState,
+    derive_workflow_state,
+    raw_directory_fingerprint,
+)
 
 _UNSAFE_ELEMENT_KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -106,8 +115,6 @@ def main() -> None:
     if "health_report" not in st.session_state:
         st.session_state["health_report"] = startup_report
         st.session_state["startup_cleanup"] = startup_cleanup
-    _render_environment_status(st)
-
     config_path = st.sidebar.text_input("Config", "configs/v1_backtest.yaml")
     try:
         base_config = load_backtest_config(config_path)
@@ -116,6 +123,8 @@ def main() -> None:
         return
 
     config = _render_sidebar_config(st, base_config)
+    _render_linear_workflow(st, go, config)
+    _render_environment_status(st)
     tabs = st.tabs(["Data Import", "Bar Builder", "Strategy Config", "Run Backtest", "Results"])
 
     with tabs[0]:
@@ -128,6 +137,254 @@ def main() -> None:
         _render_run_backtest(st, go, config)
     with tabs[4]:
         _render_result_browser(st, go, config)
+
+
+def _render_linear_workflow(st: Any, go: Any, config: BacktestConfig) -> None:
+    st.subheader("V1 Workflow")
+    health = st.session_state.get("health_report")
+    if not isinstance(health, HealthReport):
+        health = run_environment_health_check(Path.cwd())
+        st.session_state["health_report"] = health
+    plan = st.session_state.get("workflow_plan")
+    if not isinstance(plan, TaifexDownloadPlan):
+        plan = None
+    preflight = st.session_state.get("workflow_preflight")
+    if not isinstance(preflight, BacktestPreflight):
+        preflight = None
+    state = derive_workflow_state(
+        config,
+        health,
+        plan=plan,
+        plan_raw_fingerprint=st.session_state.get("workflow_plan_fingerprint"),
+        sync_complete=bool(st.session_state.get("workflow_sync_complete", False)),
+        preflight=preflight,
+        latest_run_dir=st.session_state.get("workflow_run_dir"),
+        result_loaded=bool(st.session_state.get("workflow_result_loaded", False)),
+        running_step=st.session_state.get("workflow_running_step"),
+    )
+    columns = st.columns(8, gap="small")
+    clicked_step: int | None = None
+    for column, step in zip(columns, state.steps, strict=True):
+        if column.button(
+            step.label,
+            key=f"workflow_step_{step.number}",
+            disabled=not step.enabled,
+            width="stretch",
+        ):
+            clicked_step = step.number
+
+    with st.expander("Workflow options"):
+        st.number_input(
+            "Requested trading days",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.get("workflow_limit", 1)),
+            key="workflow_limit",
+        )
+        st.checkbox(
+            "Confirm force redownload",
+            value=False,
+            key="workflow_force_redownload",
+        )
+
+    status_placeholder = st.empty()
+    _render_workflow_status(st, status_placeholder, state)
+    if clicked_step is not None:
+        st.session_state["workflow_running_step"] = clicked_step
+        st.session_state["workflow_pending_step"] = clicked_step
+        st.rerun()
+    pending_step = st.session_state.pop("workflow_pending_step", None)
+    if isinstance(pending_step, int):
+        _execute_workflow_step(st, config, pending_step, status_placeholder)
+
+    loaded = st.session_state.get("workflow_loaded_result")
+    if isinstance(loaded, LoadedResultRun):
+        st.write("Latest persisted result")
+        _render_result_summary(st, loaded.metrics)
+        _render_charts(
+            st,
+            go,
+            loaded.equity_curve,
+            loaded.trades,
+            loaded.model_bars.tail(500),
+            key_prefix="workflow_latest_result",
+        )
+
+
+def _execute_workflow_step(
+    st: Any,
+    config: BacktestConfig,
+    step: int,
+    status_placeholder: Any,
+) -> None:
+    st.session_state["workflow_running_step"] = step
+    progress = _WorkflowProgress(st, status_placeholder, step)
+    try:
+        if step == 1:
+            report = run_environment_health_check(Path.cwd(), progress_callback=progress)
+            cleanup = apply_safe_cleanup(report.cleanup_plan, Path.cwd())
+            st.session_state["health_report"] = run_environment_health_check(Path.cwd())
+            _workflow_message(st, step, "complete", f"Safe cleanup actions: {len(cleanup.applied)}")
+        elif step == 2:
+            plan = plan_recent_taifex_csv_files(
+                config.data.raw_dir,
+                limit=int(st.session_state.get("workflow_limit", 1)),
+                progress_callback=progress,
+            )
+            st.session_state["workflow_plan"] = plan
+            st.session_state["workflow_plan_fingerprint"] = raw_directory_fingerprint(
+                config.data.raw_dir
+            )
+            if plan.conflict_count:
+                _workflow_message(st, step, "warning", "Download plan has local conflicts")
+            else:
+                _workflow_message(st, step, "complete", "Download plan created")
+        elif step == 3:
+            force = bool(st.session_state.get("workflow_force_redownload", False))
+            sync_summary = sync_recent_taifex_csv_files(
+                config.data.raw_dir,
+                limit=int(st.session_state.get("workflow_limit", 1)),
+                overwrite=force,
+                progress_callback=progress,
+            )
+            st.session_state["workflow_sync_complete"] = sync_summary.files_failed == 0
+            prior_plan = st.session_state.get("workflow_plan")
+            if isinstance(prior_plan, TaifexDownloadPlan):
+                st.session_state["workflow_plan"] = build_taifex_download_plan(
+                    config.data.raw_dir, [item.remote for item in prior_plan.items]
+                )
+                st.session_state["workflow_plan_fingerprint"] = raw_directory_fingerprint(
+                    config.data.raw_dir
+                )
+            message = (
+                "Selected data already exists; no download required."
+                if sync_summary.files_downloaded == 0 and sync_summary.files_updated == 0
+                else (
+                    f"Downloaded {sync_summary.files_downloaded}, "
+                    f"updated {sync_summary.files_updated}"
+                )
+            )
+            _workflow_message(st, step, "complete", message)
+        elif step == 4:
+            import_summary = import_taifex_ticks(
+                config.data.raw_dir,
+                config.data.processed_dir,
+                progress_callback=progress,
+            )
+            message = (
+                "Raw data unchanged; import skipped."
+                if import_summary.no_op
+                else f"Published {len(import_summary.output_paths)} tick files"
+            )
+            _workflow_message(st, step, "complete", message)
+        elif step == 5:
+            bar_summary = build_bar_files(
+                config.data.processed_dir,
+                symbol=config.data.symbol,
+                timeframe=config.data.timeframe,
+                progress_callback=progress,
+            )
+            message = (
+                "Tick data unchanged; bar rebuild skipped."
+                if bar_summary.no_op
+                else f"Published {len(bar_summary.output_paths)} bar files"
+            )
+            _workflow_message(st, step, "complete", message)
+        elif step == 6:
+            prepared = prepare_backtest(config, progress_callback=progress)
+            st.session_state["workflow_preflight"] = prepared
+            _workflow_message(
+                st,
+                step,
+                "complete",
+                f"Prepared {len(prepared.model_bars)} aligned model bars",
+            )
+        elif step == 7:
+            prepared = st.session_state.get("workflow_preflight")
+            if not isinstance(prepared, BacktestPreflight):
+                raise ValueError("Preflight result is missing; run step 6")
+            result = run_backtest_from_config(
+                config,
+                preflight=prepared,
+                progress_callback=progress,
+            )
+            paths = persist_backtest_result(config, result, progress_callback=progress)
+            st.session_state["last_result"] = result
+            st.session_state["last_run_dir"] = str(paths.run_dir)
+            st.session_state["workflow_run_dir"] = str(paths.run_dir)
+            st.session_state["workflow_result_loaded"] = False
+            _workflow_message(st, step, "complete", f"Published {paths.run_dir.name}")
+        elif step == 8:
+            run_dir = st.session_state.get("workflow_run_dir")
+            if not isinstance(run_dir, str):
+                raise ValueError("No latest workflow result is available")
+            loaded = load_result_run(run_dir)
+            st.session_state["workflow_loaded_result"] = loaded
+            st.session_state["workflow_result_loaded"] = True
+            _workflow_message(st, step, "complete", "Loaded latest persisted result")
+    except OperationLockError as exc:
+        _workflow_message(st, step, "warning", format_lock_conflict(exc))
+    except (OSError, ValueError, TaifexFetchError) as exc:
+        _workflow_message(st, step, "warning", str(exc))
+    finally:
+        st.session_state["workflow_running_step"] = None
+    st.rerun()
+
+
+def _workflow_message(st: Any, step: int, status: str, message: str) -> None:
+    st.session_state["workflow_status"] = {
+        "step": step,
+        "status": status,
+        "message": message,
+    }
+
+
+def _render_workflow_status(st: Any, placeholder: Any, state: WorkflowState) -> None:
+    payload = st.session_state.get("workflow_status", {})
+    step_number = int(payload.get("step", 1)) if isinstance(payload, dict) else 1
+    step = state.steps[max(0, min(7, step_number - 1))]
+    with placeholder.container(border=True):
+        columns = st.columns(4)
+        columns[0].caption("Current step")
+        columns[0].write(f"{step.number} {step.name}")
+        columns[1].caption("Status")
+        columns[1].write(str(payload.get("status", step.status)))
+        columns[2].caption("Progress / completed")
+        columns[2].write(str(payload.get("progress", "-")))
+        columns[3].caption("Elapsed / ETA")
+        columns[3].write(str(payload.get("timing", "-")))
+        st.caption(f"Message: {payload.get('message', '-')}")
+        st.caption(f"Blocking reason: {step.blocking_reason or '-'}")
+        next_step = state.steps[step.number] if step.number < 8 else None
+        st.caption(f"Next step: {next_step.name if next_step else 'Workflow complete'}")
+
+
+class _WorkflowProgress:
+    """Render every workflow operation into one shared status placeholder."""
+
+    def __init__(self, st: Any, placeholder: Any, step: int) -> None:
+        self.st = st
+        self.placeholder = placeholder
+        self.step = step
+
+    def __call__(self, update: ProgressUpdate) -> None:
+        completed = (
+            f"{update.completed}/{update.total}"
+            if update.total is not None
+            else str(update.completed)
+        )
+        eta = f"{update.eta_seconds:.1f}s" if update.eta_seconds is not None else "calculating"
+        self.st.session_state["workflow_status"] = {
+            "step": self.step,
+            "status": "running",
+            "message": update.message,
+            "progress": f"{update.phase}: {completed}",
+            "timing": f"{update.elapsed_seconds:.1f}s / {eta}",
+        }
+        with self.placeholder.container(border=True):
+            self.st.write(f"Step {self.step}: {update.phase} …")
+            self.st.progress(update.percent or 0.0, text=completed)
+            self.st.caption(f"Elapsed {update.elapsed_seconds:.1f}s | ETA {eta} | {update.message}")
 
 
 def discover_raw_files(raw_dir: str | Path) -> list[Path]:
@@ -247,7 +504,10 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
 
 def _startup_environment_check(repository_root: str) -> tuple[HealthReport, CleanupSummary]:
     report = run_environment_health_check(repository_root)
-    cleanup = apply_safe_cleanup(report.cleanup_plan, repository_root)
+    try:
+        cleanup = apply_safe_cleanup(report.cleanup_plan, repository_root)
+    except OperationLockError as exc:
+        cleanup = CleanupSummary((), (format_lock_conflict(exc),), 0)
     if cleanup.applied:
         report = run_environment_health_check(repository_root)
     return report, cleanup
@@ -264,20 +524,14 @@ def _render_environment_status(st: Any) -> None:
     startup_cleanup = st.session_state.get("startup_cleanup")
     cleaned = len(startup_cleanup.applied) if isinstance(startup_cleanup, CleanupSummary) else 0
     status_columns[2].metric("Temporary files cleaned", cleaned)
-    status_columns[3].metric(
-        "Duplicate candidates", report.cleanup_plan.confirmation_action_count
-    )
-    status_columns[4].metric(
-        "Conflicts", sum(issue.severity == "error" for issue in report.issues)
-    )
+    status_columns[3].metric("Duplicate candidates", report.cleanup_plan.confirmation_action_count)
+    status_columns[4].metric("Conflicts", sum(issue.severity == "error" for issue in report.issues))
     controls = st.columns(3)
     if controls[0].button("Recheck", key="environment_recheck"):
         st.session_state["health_report"] = run_environment_health_check(Path.cwd())
         st.rerun()
     if controls[1].button("Full scan", key="environment_full_scan"):
-        st.session_state["health_report"] = run_environment_health_check(
-            Path.cwd(), full_scan=True
-        )
+        st.session_state["health_report"] = run_environment_health_check(Path.cwd(), full_scan=True)
         st.rerun()
     review = controls[2].toggle(
         "Review cleanup plan",
@@ -638,6 +892,8 @@ def _render_data_import(st: Any, config: BacktestConfig) -> None:
                 config.data.processed_dir,
                 progress_callback=progress,
             )
+        except OperationLockError as exc:
+            st.warning(format_lock_conflict(exc))
         except (OSError, ValueError) as exc:
             st.error(f"Import failed: {exc}")
         else:
@@ -680,6 +936,9 @@ def _render_official_sync(st: Any, config: BacktestConfig) -> None:
                 limit=int(limit),
                 progress_callback=progress,
             )
+        except OperationLockError as exc:
+            st.warning(format_lock_conflict(exc))
+            return
         except (OSError, ValueError, TaifexFetchError) as exc:
             st.error(f"TAIFEX plan failed: {exc}")
             return
@@ -821,6 +1080,9 @@ def _execute_official_sync(
                 timeframe=config.data.timeframe,
                 progress_callback=progress,
             )
+    except OperationLockError as exc:
+        st.warning(format_lock_conflict(exc))
+        return
     except (OSError, ValueError, TaifexFetchError) as exc:
         st.error(f"TAIFEX sync failed: {exc}")
         return
@@ -912,6 +1174,8 @@ def _render_bar_builder(st: Any, config: BacktestConfig) -> None:
                 force=force_rebuild,
                 progress_callback=progress,
             )
+        except OperationLockError as exc:
+            st.warning(format_lock_conflict(exc))
         except (OSError, ValueError) as exc:
             st.error(f"Bar build failed: {exc}")
         else:
@@ -970,40 +1234,23 @@ def _render_strategy_config(st: Any, config: BacktestConfig) -> None:
 
 def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
     st.subheader("Run Backtest")
-    fingerprint = _configured_bar_fingerprint(config)
-    cached_preflight = st.cache_data(show_spinner=False)(_backtest_preflight)
-    try:
-        preflight = cached_preflight(config.model_dump_json(), fingerprint)
-        preflight_error = None
-    except (OSError, ValueError) as exc:
-        preflight = {}
-        preflight_error = str(exc)
-    st.write("Data Health")
-    if preflight_error is not None:
-        st.error(preflight_error)
-    else:
+    prepared = st.session_state.get("workflow_preflight")
+    if isinstance(prepared, BacktestPreflight):
+        stats = prepared.diagnostics.get("stats", {})
         preflight_columns = st.columns(6)
-        preflight_columns[0].metric("Estimated bars", preflight.get("bar_count", 0))
-        preflight_columns[1].metric("Trading days", preflight.get("trading_days", 0))
-        preflight_columns[2].metric("Selected contracts", preflight.get("contracts", 0))
-        preflight_columns[3].metric("Roll count", preflight.get("roll_count", 0))
-        preflight_columns[4].metric("Duplicate timestamps", preflight.get("duplicates", 0))
-        preflight_columns[5].metric("Indicator readiness", preflight.get("readiness", "-"))
-        st.caption(
-            f"Date range: {preflight.get('date_range', '-')}; mode: {config.data.contract_mode}; "
-            "continuous series is unadjusted."
+        preflight_columns[0].metric("Prepared bars", len(prepared.model_bars))
+        preflight_columns[1].metric("Trading days", stats.get("trading_days", 0))
+        preflight_columns[2].metric("Selected contracts", len(stats.get("selected_contracts", [])))
+        preflight_columns[3].metric("Roll count", stats.get("roll_count", 0))
+        preflight_columns[4].metric(
+            "Duplicate timestamps", stats.get("duplicate_timestamp_count", 0)
         )
-    if st.button("Run backtest", type="primary", disabled=preflight_error is not None):
-        progress = _StreamlitProgress(st, "Running backtest")
-        try:
-            result = run_backtest_from_config(config, progress_callback=progress)
-            paths = persist_backtest_result(config, result, progress_callback=progress)
-        except (OSError, ValueError) as exc:
-            st.error(f"Backtest failed: {exc}")
-        else:
-            st.session_state["last_result"] = result
-            st.session_state["last_run_dir"] = str(paths.run_dir)
-            st.success(f"Backtest saved to {paths.run_dir}")
+        preflight_columns[5].metric(
+            "Indicator readiness", f"{float(stats.get('ema_valid_ratio', 0)):.1%}"
+        )
+        st.caption("Prepared explicitly by workflow step 6; no automatic recomputation.")
+    else:
+        st.info("Use workflow step 6 to prepare bars, indicators, signals, and diagnostics.")
 
     result = st.session_state.get("last_result")
     if isinstance(result, BacktestResult):
@@ -1026,53 +1273,6 @@ def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
         _render_backtest_diagnostics(st, result.diagnostics, result.metrics)
     else:
         st.info("Run a backtest to view equity, daily PnL, K-line overlays, and trades.")
-
-
-def _configured_bar_fingerprint(config: BacktestConfig) -> tuple[tuple[str, int, int], ...]:
-    files = discover_bar_files(
-        config.data.processed_dir,
-        symbol=config.data.symbol,
-        timeframe=config.data.timeframe,
-        start_date=config.data.start_date,
-        end_date=config.data.end_date,
-    )
-    return tuple(
-        (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns) for path in files
-    )
-
-
-def _backtest_preflight(
-    config_json: str,
-    fingerprint: tuple[tuple[str, int, int], ...],
-) -> dict[str, Any]:
-    del fingerprint
-    config = BacktestConfig.model_validate_json(config_json)
-    raw_bars = load_configured_bars(config)
-    selection = select_contract_bars(
-        raw_bars,
-        contract_mode=config.data.contract_mode,
-        contract=config.data.contract,
-        roll_confirmation_days=config.data.roll_confirmation_days,
-    )
-    params = config.strategy.params
-    enriched = append_basic_indicators(
-        selection.bars,
-        ema_fast=_int_param(dict(params), "ema_fast", 20),
-        ema_slow=_int_param(dict(params), "ema_slow", 60),
-        atr_period=_int_param(dict(params), "atr_period", 14),
-        volatility_window=_int_param(dict(params), "volatility_window", 20),
-    )
-    timestamps = pd.to_datetime(selection.bars["timestamp"])
-    readiness = enriched[["ema_fast", "ema_slow", "atr"]].notna().all(axis=1).mean()
-    return {
-        "bar_count": len(selection.bars),
-        "trading_days": int(timestamps.dt.date.nunique()),
-        "contracts": int(selection.bars["contract"].nunique()),
-        "roll_count": int(selection.audit["rolled"].sum()),
-        "duplicates": int(timestamps.duplicated().sum()),
-        "readiness": f"{readiness:.1%}",
-        "date_range": f"{timestamps.min().date()} to {timestamps.max().date()}",
-    }
 
 
 def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
@@ -1214,20 +1414,13 @@ class _StreamlitProgress:
 
     def __call__(self, update: ProgressUpdate) -> None:
         percent = update.percent
-        eta = (
-            f"{update.eta_seconds:.1f}s"
-            if update.eta_seconds is not None
-            else "Calculating..."
-        )
+        eta = f"{update.eta_seconds:.1f}s" if update.eta_seconds is not None else "Calculating..."
         count = (
             f"{update.completed} / {update.total}"
             if update.total is not None
             else str(update.completed)
         )
-        text = (
-            f"{update.phase}: {count} | elapsed {update.elapsed_seconds:.1f}s | "
-            f"ETA {eta}"
-        )
+        text = f"{update.phase}: {count} | elapsed {update.elapsed_seconds:.1f}s | ETA {eta}"
         if percent is not None:
             self.progress.progress(percent, text=text)
         else:

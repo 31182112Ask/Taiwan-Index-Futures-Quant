@@ -11,15 +11,17 @@ import pandas as pd
 from tifq.bars.resampler import resample_ticks_to_bars
 from tifq.data.schemas import V1_SYMBOL, V1_TIMEFRAMES, validate_bar_frame
 from tifq.data.storage import bar_path, read_parquet, write_parquet
-from tifq.runtime.locking import OperationLock
+from tifq.runtime.locking import PipelineOperationLock
 from tifq.runtime.manifests import (
     BAR_MANIFEST_FILENAME,
+    FileFingerprint,
     atomic_write_json,
     fingerprint_file,
     load_json_manifest,
     sha256_file,
 )
 from tifq.runtime.progress import ProgressCallback, ProgressReporter
+from tifq.runtime.transaction import StagedPublication
 
 
 @dataclass(frozen=True)
@@ -57,13 +59,6 @@ def build_bar_files(
     if not tick_files:
         return BarBuildSummary(0, 0, 0, (), manifest_path=manifest_path, no_op=True)
 
-    quarantine = processed_path.parent / "quarantine" / "manifests"
-    manifest = load_json_manifest(
-        manifest_path,
-        default={"version": 1, "records": []},
-        quarantine_dir=quarantine,
-    )
-    records = _bar_manifest_records(manifest)
     reporter = ProgressReporter("bar_build", progress_callback)
     reporter.update("Build bars", 0, len(tick_files), "Planning incremental bar build")
     files_read = 0
@@ -73,8 +68,18 @@ def build_bar_files(
     output_bars = 0
     output_paths: list[Path] = []
 
-    with OperationLock(processed_path.parent / ".runtime", "bar_build"):
+    with PipelineOperationLock(processed_path.parent / ".runtime", "bar_build"):
+        quarantine = processed_path.parent / "quarantine" / "manifests"
+        manifest = load_json_manifest(
+            manifest_path,
+            default={"version": 1, "records": []},
+            quarantine_dir=quarantine,
+        )
+        records = _bar_manifest_records(manifest)
         updated_records = dict(records)
+        changed_builds: list[
+            tuple[Path, FileFingerprint, pd.DataFrame, dict[str, object] | None]
+        ] = []
         for index, tick_file in enumerate(tick_files, start=1):
             key = f"{tick_file.resolve()}|{timeframe}"
             previous = records.get(key)
@@ -88,11 +93,41 @@ def build_bar_files(
 
             ticks = read_parquet(tick_file)
             bars = resample_ticks_to_bars(ticks, timeframe=timeframe, symbol=symbol)
-            written = _write_daily_bars(bars, processed_path, symbol, timeframe)
             files_read += 1
             files_rebuilt += 1
             input_ticks += len(ticks)
             output_bars += len(bars)
+            changed_builds.append((tick_file, fingerprint, bars, previous))
+            reporter.update("Build bars", index, len(tick_files), f"Prepared: {tick_file.name}")
+
+        if not changed_builds:
+            reporter.update("Complete", len(tick_files), len(tick_files), "Bar build complete")
+            return BarBuildSummary(
+                0,
+                0,
+                0,
+                (),
+                tick_files_skipped=files_skipped,
+                manifest_path=manifest_path,
+                no_op=True,
+            )
+
+        publication = StagedPublication(processed_path, "bars")
+        for tick_file, fingerprint, bars, previous in changed_builds:
+            key = f"{tick_file.resolve()}|{timeframe}"
+            written: list[Path] = []
+            if not bars.empty:
+                validate_bar_frame(bars)
+                for trading_date, daily_bars in bars.groupby(bars["timestamp"].dt.date, sort=True):
+                    final_path = bar_path(processed_path, symbol, timeframe, trading_date)
+                    staged_path = publication.stage_path(final_path)
+                    write_parquet(daily_bars.reset_index(drop=True), staged_path)
+                    validate_bar_frame(read_parquet(staged_path))
+                    written.append(final_path)
+            previous_outputs = set(_record_paths(previous))
+            current_outputs = {str(output.resolve()) for output in written}
+            for removed in previous_outputs - current_outputs:
+                publication.stage_delete(removed)
             output_paths.extend(written)
             updated_records[key] = {
                 "tick_path": str(tick_file.resolve()),
@@ -104,20 +139,20 @@ def build_bar_files(
                 "built_at": datetime.now(tz=UTC).isoformat(),
                 "output_paths": [str(output.resolve()) for output in written],
                 "output_hashes": {
-                    str(output.resolve()): sha256_file(output) for output in written
+                    str(output.resolve()): sha256_file(publication.stage_path(output))
+                    for output in written
                 },
             }
-            reporter.update("Build bars", index, len(tick_files), f"Built: {tick_file.name}")
-
-        if files_rebuilt:
-            atomic_write_json(
-                manifest_path,
-                {
-                    "version": 1,
-                    "builder_version": BUILDER_VERSION,
-                    "records": list(updated_records.values()),
-                },
-            )
+        staged_manifest = publication.staging_dir / manifest_path.name
+        atomic_write_json(
+            staged_manifest,
+            {
+                "version": 1,
+                "builder_version": BUILDER_VERSION,
+                "records": list(updated_records.values()),
+            },
+        )
+        publication.publish(manifest_path, staged_manifest)
     reporter.update("Complete", len(tick_files), len(tick_files), "Bar build complete")
     return BarBuildSummary(
         tick_files_read=files_read,
@@ -140,9 +175,7 @@ def discover_tick_files(processed_dir: str | Path, symbol: str = V1_SYMBOL) -> l
     if not tick_dir.is_dir():
         raise NotADirectoryError(f"Tick path is not a directory: {tick_dir}")
     return sorted(
-        path
-        for path in tick_dir.iterdir()
-        if path.is_file() and path.suffix == ".parquet"
+        path for path in tick_dir.iterdir() if path.is_file() and path.suffix == ".parquet"
     )
 
 
@@ -201,6 +234,21 @@ def _unchanged_bar_record(
     if record.get("tick_hash") != tick_hash or record.get("timeframe") != timeframe:
         return False
     output_paths = record.get("output_paths")
-    if not isinstance(output_paths, list):
+    output_hashes = record.get("output_hashes")
+    if not isinstance(output_paths, list) or not isinstance(output_hashes, dict):
         return False
-    return all(Path(str(path)).exists() for path in output_paths)
+    return all(
+        Path(str(path)).exists()
+        and isinstance(output_hashes.get(str(path)), str)
+        and sha256_file(str(path)) == output_hashes[str(path)]
+        for path in output_paths
+    )
+
+
+def _record_paths(record: dict[str, object] | None) -> list[str]:
+    if record is None:
+        return []
+    paths = record.get("output_paths")
+    if not isinstance(paths, list):
+        return []
+    return [str(path) for path in paths]

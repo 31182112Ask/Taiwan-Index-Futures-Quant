@@ -56,11 +56,15 @@ def run_environment_health_check(
         root / "data" / "raw" / "taifex",
         root / "data" / "processed",
         root / "data" / "results" / "backtests",
+        root / "data" / "quarantine",
+        root / "data" / ".runtime",
+        root / "data" / "processed" / ".staging",
         root / "logs",
     )
     reporter.update("Preflight", 0, len(required_dirs), "Checking runtime directories")
     healthy_files = 0
     for index, directory in enumerate(required_dirs, start=1):
+        directory.mkdir(parents=True, exist_ok=True)
         if directory.exists() and directory.is_dir():
             healthy_files += 1
         else:

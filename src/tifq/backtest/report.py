@@ -16,7 +16,7 @@ import yaml
 from tifq.backtest.engine import BacktestResult
 from tifq.config.models import BacktestConfig
 from tifq.data.storage import write_parquet
-from tifq.runtime.locking import OperationLock
+from tifq.runtime.locking import PipelineOperationLock
 from tifq.runtime.progress import ProgressCallback, ProgressReporter
 
 
@@ -68,7 +68,9 @@ def persist_backtest_result(
     data_fingerprint_path = staging_dir / "data_fingerprint.json"
     started = perf_counter()
     try:
-        with OperationLock(config.data.processed_dir.parent / ".runtime", "report_persistence"):
+        with PipelineOperationLock(
+            config.data.processed_dir.parent / ".runtime", "report_persistence"
+        ):
             progress.update("Persist report", 0, 10, "Writing reproducibility artifacts")
             config_payload = config.model_dump(mode="json")
             config_path.write_text(
@@ -201,5 +203,10 @@ def _empty_contract_selection() -> pd.DataFrame:
             "next_volume",
             "rolled",
             "contract_segment_id",
+            "decision_source_date",
+            "decision_current_volume",
+            "decision_next_volume",
+            "confirmation_count",
+            "roll_effective_date",
         ]
     )

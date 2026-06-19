@@ -48,6 +48,8 @@ tifq doctor
 tifq doctor --full
 tifq clean
 tifq clean --apply-safe
+tifq workflow --config configs/v1_backtest.yaml
+tifq workflow --config configs/v1_backtest.yaml --stop-after preflight
 tifq app backtest-lab
 ```
 
@@ -85,6 +87,31 @@ EMA, ATR, and realized volatility warm up again inside that segment.
 Each run persists selected model bars, signals, contract selection audit, diagnostics, timings, and
 a data fingerprint in addition to config, trades, equity, and metrics. Legacy runs remain readable
 but are labeled when these reproducibility artifacts are absent.
+
+Roll decisions use only the previous completed trading day's day-session volume. A confirmed roll
+becomes effective on the following trading day. If the active contract is absent, V1 moves to the
+nearest later month and records `current_contract_missing`. Open positions are closed on the final
+bar of the old segment with reason `contract_roll`; old-segment signals cannot execute on the new
+contract's opening bar.
+
+## Transaction Safety
+
+Every data writer acquires `data_pipeline.lock` before its operation-specific lock. Import and bar
+build first prepare complete outputs under `data/processed/.staging/`, validate schemas and hashes,
+then publish outputs with the manifest replaced last. A publish failure restores prior outputs and
+manifest. Unchanged checks verify source fingerprints, parser/builder versions, output existence,
+and output SHA-256; a modified output is rebuilt instead of being reported as a no-op.
+
+The Backtest Lab exposes one `V1 Workflow` row under the title:
+
+```text
+Check environment -> Plan data -> Sync data -> Import data -> Build bars
+-> Backtest preflight -> Run backtest -> View results
+```
+
+Markers are derived from runtime state: `✅` complete, `⚠` blocked/warning, and `…` running.
+Preflight runs only when explicitly requested and is bound to config, bar metadata, manifest hash,
+and source/output hashes. A changed config or file invalidates it before execution.
 
 ## Capital And Diagnostics
 
@@ -127,6 +154,7 @@ Task 10 completed: local Streamlit Backtest Lab.
 V1 hardening 10.1 completed: explicit official TAIFEX recent trading-day CSV sync.
 V1 final hardening Task 11 completed: contract integrity, runtime safety, incremental manifests,
 progress UX, and reproducible diagnostics.
+Task 12 completed: final correctness, transaction safety, shared locking, and linear workflow.
 Current next task: V1 review and refinement before any later version work.
 
 The `sync-taifex` command retrieves the most recent official TAIFEX futures time-and-sales CSV files advertised by the public previous-30-trading-day page. The limit means the most recent available trading days, not calendar days. Official files may contain all futures products; the existing V1 importer filters the data to TMF. Downloaded raw data and `download_manifest.json` remain local under `data/raw/taifex/` and are ignored by git. Network availability and official page structure can affect syncing, so manual `import-taifex` remains supported as a fallback.

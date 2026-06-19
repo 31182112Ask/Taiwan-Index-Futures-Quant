@@ -10,18 +10,20 @@ from zipfile import ZipFile
 
 import pandas as pd
 
-from tifq.data.schemas import TICK_REQUIRED_COLUMNS, V1_SYMBOL
-from tifq.data.storage import tick_path, write_parquet
+from tifq.data.schemas import TICK_REQUIRED_COLUMNS, V1_SYMBOL, validate_tick_frame
+from tifq.data.storage import read_parquet, tick_path, write_parquet
 from tifq.data.tick_cleaner import clean_tick_frame
-from tifq.runtime.locking import OperationLock
+from tifq.runtime.locking import PipelineOperationLock
 from tifq.runtime.manifests import (
     IMPORT_MANIFEST_FILENAME,
+    FileFingerprint,
     atomic_write_json,
     fingerprint_file,
     load_json_manifest,
     sha256_file,
 )
 from tifq.runtime.progress import ProgressCallback, ProgressReporter
+from tifq.runtime.transaction import StagedPublication
 
 
 class TaifexImportError(ValueError):
@@ -135,13 +137,6 @@ def import_taifex_ticks(
     if not raw_files:
         return ImportSummary(0, 0, 0, 0, 0, (), manifest_path=manifest_path, no_op=True)
 
-    quarantine = processed_path.parent / "quarantine" / "manifests"
-    manifest = load_json_manifest(
-        manifest_path,
-        default={"version": 1, "records": []},
-        quarantine_dir=quarantine,
-    )
-    records = _import_manifest_records(manifest)
     reporter = ProgressReporter("taifex_import", progress_callback)
     reporter.update("Import", 0, len(raw_files), "Planning incremental raw import")
     output_paths: list[Path] = []
@@ -152,8 +147,18 @@ def import_taifex_ticks(
     files_skipped = 0
     files_changed = 0
 
-    with OperationLock(processed_path.parent / ".runtime", "raw_import"):
+    with PipelineOperationLock(processed_path.parent / ".runtime", "raw_import"):
+        quarantine = processed_path.parent / "quarantine" / "manifests"
+        manifest = load_json_manifest(
+            manifest_path,
+            default={"version": 1, "records": []},
+            quarantine_dir=quarantine,
+        )
+        records = _import_manifest_records(manifest)
         updated_records = dict(records)
+        changed_inputs: list[
+            tuple[Path, FileFingerprint, pd.DataFrame, list[str], list[str], int, int]
+        ] = []
         for index, path in enumerate(raw_files, start=1):
             key = str(path.resolve())
             previous = records.get(key)
@@ -165,9 +170,7 @@ def import_taifex_ticks(
 
             raw_csvs = _read_raw_file(path)
             csv_files_read += len(raw_csvs)
-            normalized_frames = [
-                _normalize_raw_frame(frame, source) for source, frame in raw_csvs
-            ]
+            normalized_frames = [_normalize_raw_frame(frame, source) for source, frame in raw_csvs]
             if not normalized_frames:
                 reporter.update("Import", index, len(raw_files), f"No CSV rows: {path.name}")
                 continue
@@ -175,44 +178,146 @@ def import_taifex_ticks(
             clean_result = clean_tick_frame(normalized, symbol=symbol)
             source_labels = sorted(set(clean_result.ticks["source"].astype(str)))
             previous_labels = _string_list(previous, "source_labels")
-            written = _write_daily_ticks_incremental(
-                clean_result.ticks,
-                processed_path,
-                symbol,
-                source_labels=tuple(sorted(set(source_labels + previous_labels))),
-            )
-            output_paths.extend(written)
             input_rows += clean_result.input_row_count
             output_rows += len(clean_result.ticks)
             invalid_rows += clean_result.invalid_row_count
             files_changed += 1
-            updated_records[key] = {
-                "source_path": key,
+            changed_inputs.append(
+                (
+                    path,
+                    fingerprint,
+                    clean_result.ticks,
+                    source_labels,
+                    previous_labels,
+                    clean_result.input_row_count,
+                    clean_result.invalid_row_count,
+                )
+            )
+            reporter.update("Import", index, len(raw_files), f"Prepared: {path.name}")
+
+        if not changed_inputs:
+            reporter.update("Complete", len(raw_files), len(raw_files), "TAIFEX import complete")
+            return ImportSummary(
+                len(raw_files),
+                0,
+                0,
+                0,
+                0,
+                (),
+                files_skipped=files_skipped,
+                manifest_path=manifest_path,
+                no_op=True,
+            )
+
+        publication = StagedPublication(processed_path, "import")
+        changed_source_keys = {str(path.resolve()) for path, *_ in changed_inputs}
+        changed_labels = {
+            label
+            for _, _, _, source_labels, previous_labels, _, _ in changed_inputs
+            for label in source_labels + previous_labels
+        }
+        affected_dates_set = {
+            trading_date
+            for _, _, ticks, _, _, _, _ in changed_inputs
+            for trading_date in ticks["timestamp"].dt.date
+        }
+        for path, _, _, _, _, _, _ in changed_inputs:
+            previous = records.get(str(path.resolve()))
+            for previous_output in _string_list(previous, "output_paths"):
+                try:
+                    affected_dates_set.add(date.fromisoformat(Path(previous_output).stem))
+                except ValueError:
+                    continue
+        affected_dates = sorted(affected_dates_set)
+        output_hashes: dict[str, str] = {}
+        deleted_outputs: set[str] = set()
+        for trading_date in affected_dates:
+            final_path = tick_path(processed_path, symbol, _ensure_date(trading_date))
+            final_key = str(final_path.resolve())
+            contributors = {
+                source_key
+                for source_key, record in records.items()
+                if final_key in _string_list(record, "output_paths")
+            }
+            frames: list[pd.DataFrame] = []
+            if final_path.exists() and not (
+                contributors and contributors.issubset(changed_source_keys)
+            ):
+                existing = read_parquet(final_path)
+                existing = existing.loc[~existing["source"].astype(str).isin(changed_labels)]
+                if not existing.empty:
+                    frames.append(existing)
+            frames.extend(
+                ticks.loc[ticks["timestamp"].dt.date == trading_date]
+                for _, _, ticks, _, _, _, _ in changed_inputs
+                if (ticks["timestamp"].dt.date == trading_date).any()
+            )
+            if not frames:
+                publication.stage_delete(final_path)
+                deleted_outputs.add(str(final_path.resolve()))
+                continue
+            combined = pd.concat(frames, ignore_index=True)
+            combined = combined.drop_duplicates().sort_values("timestamp", kind="mergesort")
+            combined = combined.reset_index(drop=True)
+            validate_tick_frame(combined)
+            staged_path = publication.stage_path(final_path)
+            write_parquet(combined, staged_path)
+            validate_tick_frame(read_parquet(staged_path))
+            output_hashes[final_key] = sha256_file(staged_path)
+            output_paths.append(final_path)
+
+        for (
+            path,
+            fingerprint,
+            ticks,
+            source_labels,
+            _,
+            source_input_rows,
+            source_invalid,
+        ) in changed_inputs:
+            source_outputs = sorted(
+                {
+                    str(tick_path(processed_path, symbol, _ensure_date(day)).resolve())
+                    for day in ticks["timestamp"].dt.date
+                }
+            )
+            updated_records[str(path.resolve())] = {
+                "source_path": str(path.resolve()),
                 "size": fingerprint.size,
                 "mtime_ns": fingerprint.mtime_ns,
                 "sha256": fingerprint.sha256,
                 "parser_version": PARSER_VERSION,
                 "imported_at": datetime.now(tz=UTC).isoformat(),
-                "input_rows": clean_result.input_row_count,
-                "output_rows": len(clean_result.ticks),
-                "invalid_rows": clean_result.invalid_row_count,
+                "input_rows": source_input_rows,
+                "output_rows": len(ticks),
+                "invalid_rows": source_invalid,
                 "source_labels": source_labels,
-                "output_paths": [str(output.resolve()) for output in written],
-                "output_hashes": {
-                    str(output.resolve()): sha256_file(output) for output in written
-                },
+                "output_paths": source_outputs,
+                "output_hashes": {path: output_hashes[path] for path in source_outputs},
             }
-            reporter.update("Import", index, len(raw_files), f"Imported: {path.name}")
-
-        if files_changed:
-            atomic_write_json(
-                manifest_path,
-                {
-                    "version": 1,
-                    "parser_version": PARSER_VERSION,
-                    "records": list(updated_records.values()),
-                },
-            )
+        for record in updated_records.values():
+            record_paths = record.get("output_paths")
+            record_hashes = record.get("output_hashes")
+            if isinstance(record_paths, list):
+                record["output_paths"] = [
+                    path for path in record_paths if str(path) not in deleted_outputs
+                ]
+            if isinstance(record_hashes, dict):
+                for deleted in deleted_outputs:
+                    record_hashes.pop(deleted, None)
+                for output_path, output_hash in output_hashes.items():
+                    if output_path in record_hashes:
+                        record_hashes[output_path] = output_hash
+        staged_manifest = publication.staging_dir / manifest_path.name
+        atomic_write_json(
+            staged_manifest,
+            {
+                "version": 1,
+                "parser_version": PARSER_VERSION,
+                "records": list(updated_records.values()),
+            },
+        )
+        publication.publish(manifest_path, staged_manifest)
     reporter.update("Complete", len(raw_files), len(raw_files), "TAIFEX import complete")
     unique_outputs = tuple(sorted(set(output_paths)))
     return ImportSummary(
@@ -237,9 +342,7 @@ def discover_taifex_files(raw_dir: str | Path) -> list[Path]:
     if not raw_path.is_dir():
         raise NotADirectoryError(f"Raw path is not a directory: {raw_path}")
 
-    return sorted(
-        {path.resolve() for path in raw_path.rglob("*") if _is_supported_raw_file(path)}
-    )
+    return sorted({path.resolve() for path in raw_path.rglob("*") if _is_supported_raw_file(path)})
 
 
 def _is_supported_raw_file(path: Path) -> bool:
@@ -453,8 +556,17 @@ def _unchanged_import_record(
         return False
     if record.get("sha256") != getattr(fingerprint, "sha256", None):
         return False
-    paths = _string_list(record, "output_paths")
-    return bool(paths) and all(Path(path).exists() for path in paths)
+    raw_paths = record.get("output_paths")
+    hashes = record.get("output_hashes")
+    if not isinstance(raw_paths, list) or not isinstance(hashes, dict):
+        return False
+    paths = [str(path) for path in raw_paths]
+    return all(
+        Path(path).exists()
+        and isinstance(hashes.get(path), str)
+        and sha256_file(path) == hashes[path]
+        for path in paths
+    )
 
 
 def _string_list(record: dict[str, object] | None, key: str) -> list[str]:

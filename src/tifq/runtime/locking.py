@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,10 @@ _SAFE_OPERATION_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
 class OperationLockError(RuntimeError):
     """Raised when a live process already owns an operation lock."""
+
+    def __init__(self, message: str, info: OperationLockInfo | None = None) -> None:
+        super().__init__(message)
+        self.info = info
 
 
 @dataclass(frozen=True)
@@ -30,13 +35,22 @@ class OperationLockInfo:
 class OperationLock:
     """Acquire exactly one writer for a named local operation."""
 
-    def __init__(self, lock_dir: str | Path, operation: str) -> None:
+    def __init__(
+        self,
+        lock_dir: str | Path,
+        operation: str,
+        *,
+        lock_name: str | None = None,
+    ) -> None:
         safe_operation = _SAFE_OPERATION_RE.sub("_", operation).strip("_")
+        safe_lock_name = _SAFE_OPERATION_RE.sub("_", lock_name or operation).strip("_")
         if not safe_operation:
             raise ValueError("operation must contain at least one safe character")
+        if not safe_lock_name:
+            raise ValueError("lock_name must contain at least one safe character")
         self.operation = safe_operation
         self.lock_dir = Path(lock_dir)
-        self.path = self.lock_dir / f"{safe_operation}.lock"
+        self.path = self.lock_dir / f"{safe_lock_name}.lock"
         self.info: OperationLockInfo | None = None
 
     def acquire(self) -> OperationLockInfo:
@@ -47,7 +61,8 @@ class OperationLock:
             if existing is not None and _pid_is_active(existing.pid):
                 raise OperationLockError(
                     f"operation '{existing.operation}' is already running "
-                    f"under PID {existing.pid} since {existing.started_at}"
+                    f"under PID {existing.pid} since {existing.started_at}",
+                    existing,
                 )
             self.path.unlink(missing_ok=True)
 
@@ -86,6 +101,41 @@ class OperationLock:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.release()
+
+
+class PipelineOperationLock(AbstractContextManager["PipelineOperationLock"]):
+    """Acquire the shared data writer lock before an operation-specific lock."""
+
+    def __init__(self, lock_dir: str | Path, operation: str) -> None:
+        self.shared = OperationLock(lock_dir, operation, lock_name="data_pipeline")
+        self.specific = OperationLock(lock_dir, operation)
+
+    def __enter__(self) -> PipelineOperationLock:
+        self.shared.acquire()
+        try:
+            self.specific.acquire()
+        except Exception:
+            self.shared.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.specific.release()
+        self.shared.release()
+
+
+def format_lock_conflict(error: OperationLockError) -> str:
+    """Return a stable user-facing conflict message for CLI and Streamlit."""
+    info = error.info
+    if info is None:
+        return f"Another data operation is running. {error} Wait for it to finish and retry."
+    return (
+        "Another data operation is running:\n"
+        f"Operation: {info.operation}\n"
+        f"PID: {info.pid}\n"
+        f"Started: {info.started_at}\n"
+        "Recommendation: wait for completion, then retry."
+    )
 
 
 def read_operation_lock(path: str | Path) -> OperationLockInfo | None:
@@ -128,6 +178,12 @@ def remove_stale_operation_locks(lock_dir: str | Path) -> tuple[Path, ...]:
             path.unlink(missing_ok=True)
             removed.append(path)
     return tuple(removed)
+
+
+def operation_lock_is_active(path: str | Path) -> bool:
+    """Return whether a lock is well-formed and owned by a live process."""
+    info = read_operation_lock(path)
+    return info is not None and _pid_is_active(info.pid)
 
 
 def _pid_is_active(pid: int) -> bool:

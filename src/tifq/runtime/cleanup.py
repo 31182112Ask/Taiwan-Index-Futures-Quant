@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import time
 from typing import Literal
 
-from tifq.runtime.locking import OperationLock
+from tifq.runtime.locking import (
+    PipelineOperationLock,
+    active_operation_locks,
+    operation_lock_is_active,
+    read_operation_lock,
+)
 from tifq.runtime.manifests import sha256_file
 
-CleanupKind = Literal["delete_temp", "quarantine", "keep", "rebuild"]
+CleanupKind = Literal[
+    "delete_temp",
+    "delete_stale_lock",
+    "delete_staging",
+    "quarantine",
+    "keep",
+    "rebuild",
+]
 _TEMP_SUFFIXES = frozenset({".part", ".tmp", ".temp"})
 _FORBIDDEN_ROOT_NAMES = frozenset({".git", ".venv", "src", "tests", "configs"})
 
@@ -78,6 +92,53 @@ def build_cleanup_plan(
                     )
                 )
 
+    lock_root = root / "data" / ".runtime"
+    if lock_root.exists():
+        for path in sorted(lock_root.glob("*.lock")):
+            if not operation_lock_is_active(path):
+                actions.append(
+                    CleanupAction(
+                        "delete_stale_lock",
+                        path,
+                        "malformed or dead-PID operation lock",
+                        path.stat().st_size,
+                        True,
+                    )
+                )
+
+    staging_root = root / "data" / "processed" / ".staging"
+    active_operation = (
+        any(operation_lock_is_active(path) for path in lock_root.glob("*.lock"))
+        if lock_root.exists()
+        else False
+    )
+    if staging_root.exists() and not active_operation:
+        for path in sorted(child for child in staging_root.iterdir() if child.is_dir()):
+            age = now - path.stat().st_mtime
+            if age >= temp_ttl_seconds:
+                actions.append(
+                    CleanupAction(
+                        "delete_staging",
+                        path,
+                        f"stale transaction staging directory ({age:.0f}s old)",
+                        _path_size(path),
+                        True,
+                    )
+                )
+
+    for test_dir_name in ("smoke", "test-runtime"):
+        test_dir = root / "data" / test_dir_name
+        if test_dir.exists() and test_dir.is_dir():
+            actions.append(
+                CleanupAction(
+                    "quarantine",
+                    test_dir,
+                    f"allowlisted local test output: data/{test_dir_name}",
+                    _path_size(test_dir),
+                    False,
+                )
+            )
+
     if full_scan:
         actions.extend(_duplicate_raw_actions(root))
     if prune_results:
@@ -94,15 +155,38 @@ def apply_safe_cleanup(
     applied: list[CleanupAction] = []
     failed: list[str] = []
     reclaimed = 0
-    with OperationLock(root / "data" / ".runtime", "cleanup_apply"):
+    with PipelineOperationLock(root / "data" / ".runtime", "cleanup_apply"):
         for action in plan.actions:
-            if not action.safe_to_apply_automatically or action.action != "delete_temp":
+            if not action.safe_to_apply_automatically or action.action not in {
+                "delete_temp",
+                "delete_stale_lock",
+                "delete_staging",
+            }:
                 continue
             try:
                 _validate_cleanup_path(action.path, root)
-                if action.path.suffix.lower() not in _TEMP_SUFFIXES:
-                    raise ValueError(f"not an allowlisted temporary file: {action.path}")
-                action.path.unlink(missing_ok=True)
+                if action.action == "delete_temp":
+                    if action.path.suffix.lower() not in _TEMP_SUFFIXES:
+                        raise ValueError(f"not an allowlisted temporary file: {action.path}")
+                    action.path.unlink(missing_ok=True)
+                elif action.action == "delete_stale_lock":
+                    if action.path.suffix.lower() != ".lock":
+                        raise ValueError(f"lock is not allowlisted: {action.path}")
+                    if operation_lock_is_active(action.path):
+                        info = read_operation_lock(action.path)
+                        if info is None or info.pid != os.getpid():
+                            raise ValueError(f"lock is active: {action.path}")
+                    else:
+                        action.path.unlink(missing_ok=True)
+                else:
+                    staging_root = (root / "data" / "processed" / ".staging").resolve()
+                    action.path.resolve().relative_to(staging_root)
+                    if any(
+                        info.pid != os.getpid()
+                        for info in active_operation_locks(root / "data" / ".runtime")
+                    ):
+                        raise ValueError("an active operation protects transaction staging")
+                    shutil.rmtree(action.path)
                 applied.append(action)
                 reclaimed += action.size_bytes
             except (OSError, ValueError) as exc:
@@ -116,12 +200,12 @@ def apply_confirmed_cleanup(
 ) -> CleanupSummary:
     """Quarantine explicitly confirmed valuable/conflicting files; never delete them."""
     root = Path(repository_root).resolve()
-    quarantine_root = root / "data" / "quarantine" / datetime.now(tz=UTC).strftime(
-        "%Y%m%dT%H%M%S%fZ"
+    quarantine_root = (
+        root / "data" / "quarantine" / datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S%fZ")
     )
     applied: list[CleanupAction] = []
     failed: list[str] = []
-    with OperationLock(root / "data" / ".runtime", "cleanup_apply"):
+    with PipelineOperationLock(root / "data" / ".runtime", "cleanup_apply"):
         for action in actions:
             if action.action != "quarantine" or action.safe_to_apply_automatically:
                 continue

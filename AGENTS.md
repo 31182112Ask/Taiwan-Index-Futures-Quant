@@ -1281,3 +1281,24 @@ The following rules are mandatory for all V1 maintenance:
 * Long operations must expose phase, completed/total when known, elapsed time, and factual ETA when
   enough samples exist. Do not add artificial delays.
 * UI changes require real browser interaction, screenshots, and terminal-log inspection.
+
+---
+
+# 27. Task 12 Correctness And Workflow Invariants
+
+* A signal and its same-row model bar must align on timestamp, symbol, contract, and
+  `contract_segment_id` before execution begins.
+* A signal from an old contract segment never executes on a new segment. Any open position closes
+  on the old segment's final available bar with `contract_roll` before new-contract valuation.
+* Continuous-contract volume decisions use only the previous completed trading day and become
+  effective on the next trading day. Current-day full volume never changes current-day selection.
+* All data writers acquire `data_pipeline.lock` before an operation-specific lock. No operation may
+  reverse this order.
+* Import and bar build stage complete candidate outputs and manifest before publish. Outputs publish
+  first, manifest publishes last, and any failure restores the prior formal state.
+* Incremental no-op checks validate output SHA-256 in addition to source fingerprint and code
+  version. Existing files with mismatched hashes are corrupt inputs to rebuild, not cache hits.
+* Backtest preflight is explicit and produces model bars, aligned signals, diagnostics, and a data
+  fingerprint without executing trades. Execution rejects stale preflight artifacts.
+* The eight primary V1 operations remain in one top-level workflow row. Completion and warning
+  markers must be computed from current manifests, hashes, diagnostics, and persisted artifacts.

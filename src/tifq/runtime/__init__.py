@@ -9,7 +9,14 @@ from tifq.runtime.cleanup import (
     build_cleanup_plan,
 )
 from tifq.runtime.health import HealthIssue, HealthReport, run_environment_health_check
-from tifq.runtime.locking import OperationLock, OperationLockError, OperationLockInfo
+from tifq.runtime.locking import (
+    OperationLock,
+    OperationLockError,
+    OperationLockInfo,
+    PipelineOperationLock,
+    format_lock_conflict,
+    operation_lock_is_active,
+)
 from tifq.runtime.progress import ProgressCallback, ProgressReporter, ProgressUpdate
 
 __all__ = [
@@ -21,11 +28,14 @@ __all__ = [
     "OperationLock",
     "OperationLockError",
     "OperationLockInfo",
+    "PipelineOperationLock",
     "ProgressCallback",
     "ProgressReporter",
     "ProgressUpdate",
     "apply_confirmed_cleanup",
     "apply_safe_cleanup",
     "build_cleanup_plan",
+    "format_lock_conflict",
+    "operation_lock_is_active",
     "run_environment_health_check",
 ]
