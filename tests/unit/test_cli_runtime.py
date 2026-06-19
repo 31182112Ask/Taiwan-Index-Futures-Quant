@@ -63,7 +63,12 @@ def test_clean_is_dry_run_by_default_and_apply_safe_deletes_only_temp(
 
 
 def test_sync_overwrite_requires_yes() -> None:
-    result = runner.invoke(app, ["sync-taifex", "--overwrite", "--download-only"])
+    result = runner.invoke(
+        app,
+        ["sync-taifex", "--overwrite", "--download-only"],
+        terminal_width=200,
+        color=False,
+    )
 
     assert result.exit_code == 2
     assert "requires explicit --yes" in result.stderr
@@ -104,7 +109,7 @@ def test_sync_plan_does_not_call_download(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_workflow_help_lists_stop_and_machine_readable_options() -> None:
-    result = runner.invoke(app, ["workflow", "--help"])
+    result = runner.invoke(app, ["workflow", "--help"], terminal_width=200, color=False)
 
     assert result.exit_code == 0
     assert "--stop-after" in result.stdout
