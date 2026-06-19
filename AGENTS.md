@@ -65,6 +65,13 @@ V1 must not support:
 * Account or margin synchronization
 * Live position management
 
+V1 may support explicit, low-frequency synchronization of recent historical CSV files
+from public official TAIFEX download links. This synchronization must remain
+idempotent, user-triggered, and limited to local historical research data. It must
+not bypass access controls, authentication, CAPTCHA, rate limits, or anti-bot
+mechanisms, and it must not introduce broker integration, live-market feeds, or
+order placement.
+
 ## V2 — Replay Engine
 
 Purpose:

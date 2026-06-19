@@ -113,6 +113,21 @@ def test_discover_taifex_files_returns_only_csv_and_zip(tmp_path: Path) -> None:
     assert discover_taifex_files(tmp_path) == [tmp_path / "a.csv", tmp_path / "b.zip"]
 
 
+def test_discover_taifex_files_recurses_into_official_download_layout(tmp_path: Path) -> None:
+    nested_dir = tmp_path / "official" / "2026-06-18"
+    nested_dir.mkdir(parents=True)
+    top_level = tmp_path / "manual.csv"
+    nested = nested_dir / "Daily_20260618.csv"
+    part = nested_dir / "Daily_20260618.csv.part"
+    manifest = tmp_path / "download_manifest.json"
+    write_text(top_level, "")
+    write_text(nested, "")
+    write_text(part, "")
+    write_text(manifest, "{}")
+
+    assert discover_taifex_files(tmp_path) == [top_level, nested]
+
+
 def test_import_taifex_ticks_rejects_missing_required_columns(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()

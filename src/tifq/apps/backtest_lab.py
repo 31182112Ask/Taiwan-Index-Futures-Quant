@@ -23,6 +23,7 @@ from tifq.config import ConfigLoadError, load_backtest_config
 from tifq.config.models import BacktestConfig
 from tifq.data import import_taifex_ticks
 from tifq.data.storage import read_parquet
+from tifq.data.taifex_fetcher import TaifexFetchSummary, sync_recent_taifex_csv_files
 from tifq.indicators import append_basic_indicators
 
 
@@ -364,6 +365,7 @@ def _render_sidebar_config(st: Any, base_config: BacktestConfig) -> BacktestConf
 
 def _render_data_import(st: Any, config: BacktestConfig) -> None:
     st.subheader("Data Import")
+    _render_official_sync(st, config)
     raw_files = discover_raw_files(config.data.raw_dir)
     tick_summary = summarize_ticks(config.data.processed_dir, config.data.symbol)
 
@@ -399,6 +401,77 @@ def _render_data_import(st: Any, config: BacktestConfig) -> None:
                     "output_paths": [str(path) for path in summary.output_paths],
                 }
             )
+
+
+def _render_official_sync(st: Any, config: BacktestConfig) -> None:
+    st.write("Official TAIFEX Sync")
+    sync_cols = st.columns(3)
+    limit = sync_cols[0].number_input(
+        "Number of trading days",
+        min_value=1,
+        max_value=30,
+        value=30,
+    )
+    overwrite = sync_cols[1].checkbox("Overwrite existing files", value=False)
+    sync_cols[2].metric("Selected bar timeframe", config.data.timeframe)
+
+    button_cols = st.columns(2)
+    download_only = button_cols[0].button("Sync downloads only")
+    full_sync = button_cols[1].button("Sync, import, and build bars", type="primary")
+    if not (download_only or full_sync):
+        return
+
+    status = st.status("Syncing official TAIFEX files...", expanded=True)
+    try:
+        fetch_summary = sync_recent_taifex_csv_files(
+            config.data.raw_dir,
+            limit=int(limit),
+            overwrite=bool(overwrite),
+        )
+        import_summary = None
+        bar_summary = None
+        if full_sync:
+            import_summary = import_taifex_ticks(
+                config.data.raw_dir,
+                config.data.processed_dir,
+                symbol=config.data.symbol,
+            )
+            bar_summary = build_bar_files(
+                config.data.processed_dir,
+                symbol=config.data.symbol,
+                timeframe=config.data.timeframe,
+            )
+    except (OSError, ValueError) as exc:
+        status.update(label=f"TAIFEX sync failed: {exc}", state="error")
+        return
+
+    status.update(label="Official TAIFEX sync completed.", state="complete")
+    st.json(_sync_display_payload(fetch_summary, import_summary, bar_summary))
+
+
+def _sync_display_payload(
+    fetch_summary: TaifexFetchSummary,
+    import_summary: Any | None,
+    bar_summary: Any | None,
+) -> dict[str, Any]:
+    dates = [record.trading_date for record in fetch_summary.records]
+    payload: dict[str, Any] = {
+        "remote_files_discovered": fetch_summary.files_discovered,
+        "files_selected": fetch_summary.files_selected,
+        "downloaded": fetch_summary.files_downloaded,
+        "skipped": fetch_summary.files_skipped,
+        "updated": fetch_summary.files_updated,
+        "failed": 0,
+        "latest_available_trading_date": max(dates).isoformat() if dates else "-",
+        "earliest_available_trading_date": min(dates).isoformat() if dates else "-",
+        "download_paths": [str(record.local_path) for record in fetch_summary.records],
+    }
+    if import_summary is not None:
+        payload["imported_tick_count"] = import_summary.output_tick_count
+        payload["filtered_invalid_tick_count"] = import_summary.invalid_row_count
+    if bar_summary is not None:
+        payload["built_bar_count"] = bar_summary.output_bar_count
+    return payload
 
 
 def _render_bar_builder(st: Any, config: BacktestConfig) -> None:

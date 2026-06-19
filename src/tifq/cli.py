@@ -12,7 +12,7 @@ from tifq import __version__
 from tifq.backtest import persist_backtest_result, run_backtest_from_config
 from tifq.bars import build_bar_files
 from tifq.config import ConfigLoadError, load_backtest_config
-from tifq.data import import_taifex_ticks
+from tifq.data import import_taifex_ticks, sync_recent_taifex_csv_files
 
 app = typer.Typer(
     help="Taiwan Index Futures Quant - V1 Backtest Lab CLI.",
@@ -156,6 +156,77 @@ def build_bars(
             typer.echo(f"  {output_path}")
     else:
         typer.echo("Output files: none")
+
+
+@app.command("sync-taifex")
+def sync_taifex(
+    raw_dir: Annotated[
+        Path,
+        typer.Option(help="Directory for official raw TAIFEX downloads."),
+    ] = Path("data/raw/taifex"),
+    processed_dir: Annotated[
+        Path,
+        typer.Option(help="Directory for processed tick data and bar outputs."),
+    ] = Path("data/processed"),
+    symbol: Annotated[
+        str,
+        typer.Option(help="Product symbol. V1 supports TMF only."),
+    ] = "TMF",
+    timeframe: Annotated[
+        str,
+        typer.Option(help="Bar timeframe: 1m or 5m."),
+    ] = "5m",
+    limit: Annotated[
+        int,
+        typer.Option(help="Most recent official trading days to sync, from 1 to 30."),
+    ] = 30,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Download files again even when a valid manifest entry exists."),
+    ] = False,
+    download_only: Annotated[
+        bool,
+        typer.Option(help="Stop after downloading official files."),
+    ] = False,
+) -> None:
+    """Download official recent TAIFEX files, then optionally import and build bars."""
+    if symbol != "TMF":
+        raise typer.BadParameter("V1 supports TMF only.")
+    if timeframe not in {"1m", "5m"}:
+        raise typer.BadParameter("V1 supports only 1m and 5m timeframes.")
+    if not 1 <= limit <= 30:
+        raise typer.BadParameter("limit must be between 1 and 30.")
+
+    try:
+        fetch_summary = sync_recent_taifex_csv_files(
+            raw_dir,
+            limit=limit,
+            overwrite=overwrite,
+        )
+        import_summary = None
+        bar_summary = None
+        if not download_only:
+            import_summary = import_taifex_ticks(raw_dir, processed_dir, symbol=symbol)
+            bar_summary = build_bar_files(processed_dir, symbol=symbol, timeframe=timeframe)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"TAIFEX sync failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho("Official TAIFEX sync completed.", fg=typer.colors.GREEN)
+    typer.echo(f"Remote files discovered: {fetch_summary.files_discovered}")
+    typer.echo(f"Files selected: {fetch_summary.files_selected}")
+    typer.echo(f"Downloaded: {fetch_summary.files_downloaded}")
+    typer.echo(f"Skipped: {fetch_summary.files_skipped}")
+    typer.echo(f"Updated: {fetch_summary.files_updated}")
+    if fetch_summary.records:
+        typer.echo("Download records:")
+        for record in fetch_summary.records:
+            typer.echo(f"  {record.trading_date} {record.status} {record.local_path}")
+    if import_summary is not None:
+        typer.echo(f"Clean TMF ticks: {import_summary.output_tick_count}")
+        typer.echo(f"Invalid or filtered rows: {import_summary.invalid_row_count}")
+    if bar_summary is not None:
+        typer.echo(f"Built bars: {bar_summary.output_bar_count}")
 
 
 @app.command("backtest")

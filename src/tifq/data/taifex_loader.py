@@ -148,10 +148,12 @@ def discover_taifex_files(raw_dir: str | Path) -> list[Path]:
         raise NotADirectoryError(f"Raw path is not a directory: {raw_path}")
 
     return sorted(
-        path
-        for path in raw_path.iterdir()
-        if path.is_file() and path.suffix.lower() in {".csv", ".zip"}
+        {path.resolve() for path in raw_path.rglob("*") if _is_supported_raw_file(path)}
     )
+
+
+def _is_supported_raw_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in {".csv", ".zip"}
 
 
 def _read_raw_file(path: Path) -> list[tuple[str, pd.DataFrame]]:
