@@ -22,6 +22,7 @@ dependencies = [
     "streamlit",
     "plotly",
     "rich",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,8 @@ dev = [
     "mypy",
     "pandas-stubs",
     "types-PyYAML",
+    "types-psutil",
+    "pytest-playwright",
 ]
 
 [project.scripts]

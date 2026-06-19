@@ -477,7 +477,8 @@ def _request_with_retries(client: httpx.Client, url: str, label: str) -> httpx.R
             if attempt == MAX_DOWNLOAD_ATTEMPTS - 1:
                 break
             time.sleep(0.2 * (2**attempt))
-    raise TaifexFetchError(f"{label} failed after retries: {url}") from last_error
+    detail = f"; last error: {last_error}" if last_error is not None else ""
+    raise TaifexFetchError(f"{label} failed after retries: {url}{detail}") from last_error
 
 
 def _validate_download_body(body: bytes, content_type: str, filename: str) -> None:

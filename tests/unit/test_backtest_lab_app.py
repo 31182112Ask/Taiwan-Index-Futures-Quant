@@ -20,6 +20,7 @@ from tifq.apps.backtest_lab import (
     discover_raw_files,
     discover_result_runs,
     load_result_run,
+    sync_workflow_outcome,
 )
 from tifq.config.models import BacktestConfig
 from tifq.data.taifex_fetcher import TaifexDownloadFailure, TaifexFetchSummary
@@ -292,6 +293,44 @@ def test_sync_display_payload_keeps_import_and_build_empty_when_downloads_fail(
     assert payload["failures"][0]["error"] == "HTML error page"
     assert "imported_tick_count" not in payload
     assert "built_bar_count" not in payload
+
+
+def test_sync_status_message_matches_actual_summary(tmp_path: Path) -> None:
+    summary = TaifexFetchSummary(
+        files_discovered=2,
+        files_selected=2,
+        files_downloaded=1,
+        files_skipped=0,
+        files_updated=0,
+        files_failed=1,
+        records=(),
+        failures=(
+            TaifexDownloadFailure(
+                trading_date=date(2026, 6, 17),
+                download_url="https://www.taifex.com.tw/file/Daily_20260617.csv",
+                remote_filename="Daily_20260617.csv",
+                local_path=tmp_path / "Daily_20260617.csv",
+                error="HTML error page",
+            ),
+        ),
+    )
+
+    status, message = sync_workflow_outcome(summary)
+
+    assert status == "warning"
+    assert "Failed 1" in message
+    assert "2026-06-17" in message
+    assert "HTML error page" in message
+    assert "safe to retry: yes" in message
+
+
+def test_zero_failure_sync_status_message_is_complete() -> None:
+    summary = TaifexFetchSummary(1, 1, 0, 1, 0, 0, (), ())
+
+    status, message = sync_workflow_outcome(summary)
+
+    assert status == "complete"
+    assert "already exists" in message
 
 
 def test_render_charts_requires_key_prefix() -> None:

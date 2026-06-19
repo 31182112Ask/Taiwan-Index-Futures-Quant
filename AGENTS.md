@@ -1302,3 +1302,22 @@ The following rules are mandatory for all V1 maintenance:
   fingerprint without executing trades. Execution rejects stale preflight artifacts.
 * The eight primary V1 operations remain in one top-level workflow row. Completion and warning
   markers must be computed from current manifests, hashes, diagnostics, and persisted artifacts.
+
+---
+
+# 28. Task 13 Final Release Invariants
+
+* Windows process-liveness checks must never use `os.kill(pid, 0)`. Lock ownership must validate
+  both PID existence and process creation time without terminating or signaling any process.
+* Every V1 trading day must end with a flat portfolio. An exact 13:35 bar closes at its open;
+  otherwise the final available pre-13:35 bar closes at its close. No entry is allowed at or after
+  13:35, and no signal may carry into the next trading day.
+* Workflow completion must be derived from current disk artifacts, manifests, SHA-256 values, and
+  matching data fingerprints. Persisted workflow state is an index only; Streamlit session state is
+  never the sole completion authority.
+* A partial data sync is a warning, never complete, and must block import until every selected file
+  is valid against the download manifest.
+* V1 release acceptance requires passing local Windows checks, Windows and Ubuntu CI, a real
+  official TAIFEX smoke test, and complete browser click-through with screenshots and clean logs.
+* Browser release acceptance must be reproducible with the repository's Python Playwright E2E
+  suite. CI uses deterministic local HTTP fixtures and must not depend on live TAIFEX availability.

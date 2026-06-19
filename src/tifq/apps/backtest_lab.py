@@ -51,6 +51,9 @@ from tifq.runtime.progress import ProgressUpdate
 from tifq.workflow import (
     WorkflowState,
     derive_workflow_state,
+    discover_latest_matching_result,
+    load_persisted_workflow_plan,
+    persist_workflow_plan,
     raw_directory_fingerprint,
 )
 
@@ -123,6 +126,7 @@ def main() -> None:
         return
 
     config = _render_sidebar_config(st, base_config)
+    _restore_disk_workflow_state(st, config)
     _render_linear_workflow(st, go, config)
     _render_environment_status(st)
     tabs = st.tabs(["Data Import", "Bar Builder", "Strategy Config", "Run Backtest", "Results"])
@@ -156,10 +160,8 @@ def _render_linear_workflow(st: Any, go: Any, config: BacktestConfig) -> None:
         health,
         plan=plan,
         plan_raw_fingerprint=st.session_state.get("workflow_plan_fingerprint"),
-        sync_complete=bool(st.session_state.get("workflow_sync_complete", False)),
         preflight=preflight,
         latest_run_dir=st.session_state.get("workflow_run_dir"),
-        result_loaded=bool(st.session_state.get("workflow_result_loaded", False)),
         running_step=st.session_state.get("workflow_running_step"),
     )
     columns = st.columns(8, gap="small")
@@ -168,6 +170,7 @@ def _render_linear_workflow(st: Any, go: Any, config: BacktestConfig) -> None:
         if column.button(
             step.label,
             key=f"workflow_step_{step.number}",
+            help=step.name,
             disabled=not step.enabled,
             width="stretch",
         ):
@@ -197,8 +200,16 @@ def _render_linear_workflow(st: Any, go: Any, config: BacktestConfig) -> None:
     if isinstance(pending_step, int):
         _execute_workflow_step(st, config, pending_step, status_placeholder)
 
-    loaded = st.session_state.get("workflow_loaded_result")
-    if isinstance(loaded, LoadedResultRun):
+    run_dir = st.session_state.get("workflow_run_dir")
+    loaded: LoadedResultRun | None = None
+    if isinstance(run_dir, str) and state.steps[7].status == "complete":
+        run_path = Path(run_dir)
+        try:
+            cached_load = st.cache_data(show_spinner=False)(_load_result_run_cached)
+            loaded = cached_load(str(run_path), _run_dir_fingerprint(run_path))
+        except (OSError, ValueError):
+            loaded = None
+    if loaded is not None:
         st.write("Latest persisted result")
         _render_result_summary(st, loaded.metrics)
         _render_charts(
@@ -235,6 +246,11 @@ def _execute_workflow_step(
             st.session_state["workflow_plan_fingerprint"] = raw_directory_fingerprint(
                 config.data.raw_dir
             )
+            persist_workflow_plan(
+                config,
+                plan,
+                requested_limit=int(st.session_state.get("workflow_limit", 1)),
+            )
             if plan.conflict_count:
                 _workflow_message(st, step, "warning", "Download plan has local conflicts")
             else:
@@ -247,24 +263,26 @@ def _execute_workflow_step(
                 overwrite=force,
                 progress_callback=progress,
             )
-            st.session_state["workflow_sync_complete"] = sync_summary.files_failed == 0
             prior_plan = st.session_state.get("workflow_plan")
             if isinstance(prior_plan, TaifexDownloadPlan):
-                st.session_state["workflow_plan"] = build_taifex_download_plan(
+                refreshed_plan = build_taifex_download_plan(
                     config.data.raw_dir, [item.remote for item in prior_plan.items]
                 )
+                st.session_state["workflow_plan"] = refreshed_plan
                 st.session_state["workflow_plan_fingerprint"] = raw_directory_fingerprint(
                     config.data.raw_dir
                 )
-            message = (
-                "Selected data already exists; no download required."
-                if sync_summary.files_downloaded == 0 and sync_summary.files_updated == 0
-                else (
-                    f"Downloaded {sync_summary.files_downloaded}, "
-                    f"updated {sync_summary.files_updated}"
+                persist_workflow_plan(
+                    config,
+                    refreshed_plan,
+                    requested_limit=int(st.session_state.get("workflow_limit", 1)),
                 )
-            )
-            _workflow_message(st, step, "complete", message)
+            if sync_summary.files_failed:
+                status, message = sync_workflow_outcome(sync_summary)
+                _workflow_message(st, step, status, message)
+            else:
+                status, message = sync_workflow_outcome(sync_summary)
+                _workflow_message(st, step, status, message)
         elif step == 4:
             import_summary = import_taifex_ticks(
                 config.data.raw_dir,
@@ -312,15 +330,12 @@ def _execute_workflow_step(
             st.session_state["last_result"] = result
             st.session_state["last_run_dir"] = str(paths.run_dir)
             st.session_state["workflow_run_dir"] = str(paths.run_dir)
-            st.session_state["workflow_result_loaded"] = False
             _workflow_message(st, step, "complete", f"Published {paths.run_dir.name}")
         elif step == 8:
             run_dir = st.session_state.get("workflow_run_dir")
             if not isinstance(run_dir, str):
                 raise ValueError("No latest workflow result is available")
-            loaded = load_result_run(run_dir)
-            st.session_state["workflow_loaded_result"] = loaded
-            st.session_state["workflow_result_loaded"] = True
+            load_result_run(run_dir)
             _workflow_message(st, step, "complete", "Loaded latest persisted result")
     except OperationLockError as exc:
         _workflow_message(st, step, "warning", format_lock_conflict(exc))
@@ -331,12 +346,58 @@ def _execute_workflow_step(
     st.rerun()
 
 
+def _restore_disk_workflow_state(st: Any, config: BacktestConfig) -> None:
+    """Restore only workflow state that current on-disk artifacts can prove."""
+    context = config.model_dump_json()
+    if st.session_state.get("workflow_restore_context") == context:
+        return
+    st.session_state["workflow_restore_context"] = context
+    plan, fingerprint = load_persisted_workflow_plan(config)
+    if plan is not None and fingerprint is not None:
+        st.session_state["workflow_plan"] = plan
+        st.session_state["workflow_plan_fingerprint"] = fingerprint
+    else:
+        st.session_state.pop("workflow_plan", None)
+        st.session_state.pop("workflow_plan_fingerprint", None)
+
+    run_dir = discover_latest_matching_result(config)
+    if run_dir is None:
+        st.session_state.pop("workflow_run_dir", None)
+        return
+    try:
+        load_result_run(run_dir)
+    except (OSError, ValueError):
+        st.session_state.pop("workflow_run_dir", None)
+        return
+    st.session_state["workflow_run_dir"] = str(run_dir)
+
+
 def _workflow_message(st: Any, step: int, status: str, message: str) -> None:
     st.session_state["workflow_status"] = {
         "step": step,
         "status": status,
         "message": message,
     }
+
+
+def sync_workflow_outcome(summary: TaifexFetchSummary) -> tuple[str, str]:
+    """Return a factual workflow status and user-facing sync summary."""
+    if summary.files_failed:
+        failures = "; ".join(
+            f"{failure.trading_date}: {failure.local_path} — {failure.error}"
+            for failure in summary.failures
+        )
+        return (
+            "warning",
+            f"Failed {summary.files_failed}; succeeded {len(summary.records)}; "
+            f"safe to retry: yes. {failures}",
+        )
+    if summary.files_downloaded == 0 and summary.files_updated == 0:
+        return "complete", "Selected data already exists; no download required."
+    return (
+        "complete",
+        f"Downloaded {summary.files_downloaded}, updated {summary.files_updated}",
+    )
 
 
 def _render_workflow_status(st: Any, placeholder: Any, state: WorkflowState) -> None:
@@ -1791,6 +1852,7 @@ def _inject_style(st: Any) -> None:
         h2, h3 { letter-spacing: 0; }
         [data-testid="stMetricValue"] { font-size: 1.2rem; }
         [data-testid="stSidebar"] { min-width: 20rem; }
+        [data-testid="stHorizontalBlock"] button p { white-space: nowrap; }
         </style>
         """,
         unsafe_allow_html=True,

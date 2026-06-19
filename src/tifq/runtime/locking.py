@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
+import psutil
+
 _SAFE_OPERATION_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
@@ -28,6 +30,7 @@ class OperationLockInfo:
 
     operation: str
     pid: int
+    process_create_time: float
     started_at: str
     path: Path
 
@@ -58,17 +61,27 @@ class OperationLock:
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             existing = read_operation_lock(self.path)
-            if existing is not None and _pid_is_active(existing.pid):
+            if existing is not None and _lock_owner_is_active(existing):
                 raise OperationLockError(
                     f"operation '{existing.operation}' is already running "
                     f"under PID {existing.pid} since {existing.started_at}",
                     existing,
                 )
+            if existing is None and self.path.name != "data_pipeline.lock":
+                pipeline_info = read_operation_lock(self.lock_dir / "data_pipeline.lock")
+                if pipeline_info is not None and _lock_owner_is_active(pipeline_info):
+                    raise OperationLockError(
+                        "malformed operation lock cannot be recovered while the data pipeline "
+                        "is active",
+                        pipeline_info,
+                    )
             self.path.unlink(missing_ok=True)
 
+        process_create_time = psutil.Process(os.getpid()).create_time()
         payload = {
             "operation": self.operation,
             "pid": os.getpid(),
+            "process_create_time": process_create_time,
             "started_at": datetime.now(tz=UTC).isoformat(),
             "path": str(self.path),
         }
@@ -83,6 +96,7 @@ class OperationLock:
         self.info = OperationLockInfo(
             operation=self.operation,
             pid=os.getpid(),
+            process_create_time=process_create_time,
             started_at=str(payload["started_at"]),
             path=self.path,
         )
@@ -91,7 +105,11 @@ class OperationLock:
     def release(self) -> None:
         """Release only a lock still owned by this process."""
         existing = read_operation_lock(self.path)
-        if existing is not None and existing.pid == os.getpid():
+        if (
+            existing is not None
+            and existing.pid == os.getpid()
+            and _lock_owner_is_active(existing)
+        ):
             self.path.unlink(missing_ok=True)
         self.info = None
 
@@ -146,6 +164,7 @@ def read_operation_lock(path: str | Path) -> OperationLockInfo | None:
         return OperationLockInfo(
             operation=str(payload["operation"]),
             pid=int(payload["pid"]),
+            process_create_time=float(payload["process_create_time"]),
             started_at=str(payload["started_at"]),
             path=lock_path,
         )
@@ -161,7 +180,7 @@ def active_operation_locks(lock_dir: str | Path) -> tuple[OperationLockInfo, ...
     active: list[OperationLockInfo] = []
     for path in sorted(root.glob("*.lock")):
         info = read_operation_lock(path)
-        if info is not None and _pid_is_active(info.pid):
+        if info is not None and _lock_owner_is_active(info):
             active.append(info)
     return tuple(active)
 
@@ -171,10 +190,19 @@ def remove_stale_operation_locks(lock_dir: str | Path) -> tuple[Path, ...]:
     root = Path(lock_dir)
     if not root.exists():
         return ()
+    paths = sorted(root.glob("*.lock"))
+    parsed = [(path, read_operation_lock(path)) for path in paths]
+    active_pipeline = any(
+        path.name == "data_pipeline.lock"
+        and info is not None
+        and _lock_owner_is_active(info)
+        for path, info in parsed
+    )
     removed: list[Path] = []
-    for path in sorted(root.glob("*.lock")):
-        info = read_operation_lock(path)
-        if info is None or not _pid_is_active(info.pid):
+    for path, info in parsed:
+        if info is None and active_pipeline:
+            continue
+        if info is None or not _lock_owner_is_active(info):
             path.unlink(missing_ok=True)
             removed.append(path)
     return tuple(removed)
@@ -183,20 +211,17 @@ def remove_stale_operation_locks(lock_dir: str | Path) -> tuple[Path, ...]:
 def operation_lock_is_active(path: str | Path) -> bool:
     """Return whether a lock is well-formed and owned by a live process."""
     info = read_operation_lock(path)
-    return info is not None and _pid_is_active(info.pid)
+    return info is not None and _lock_owner_is_active(info)
 
 
-def _pid_is_active(pid: int) -> bool:
-    if pid <= 0:
+def _lock_owner_is_active(info: OperationLockInfo) -> bool:
+    """Safely verify PID identity without signaling or terminating a process."""
+    if info.pid <= 0 or info.process_create_time <= 0:
         return False
-    if pid == os.getpid():
-        return True
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        actual_create_time = psutil.Process(info.pid).create_time()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
-    except PermissionError:
+    except psutil.AccessDenied:
         return True
-    except OSError:
-        return False
-    return True
+    return bool(abs(actual_create_time - info.process_create_time) < 1e-6)

@@ -113,6 +113,33 @@ Markers are derived from runtime state: `✅` complete, `⚠` blocked/warning, a
 Preflight runs only when explicitly requested and is bound to config, bar metadata, manifest hash,
 and source/output hashes. A changed config or file invalidates it before execution.
 
+The latest download plan is indexed in `data/.runtime/workflow_state.json`. This file is never the
+sole source of truth: restart recovery revalidates the plan age and raw-directory fingerprint,
+download manifest and file hashes, import/bar manifests and output hashes, and result fingerprint
+and readable artifacts. A partial sync is always `⚠`, blocks import, and reports failed dates,
+paths, errors, successful files, and whether retry is safe.
+
+## Session Risk Controls
+
+Normal strategy signals execute at the next bar open. Session boundaries are engine-level risk
+controls:
+
+- If a 13:35 bar exists, an open position closes at that bar's open with `session_end`.
+- If 13:35 is missing, it closes at the last available pre-13:35 close with
+  `session_end_fallback`.
+- No new position may open at or after 13:35, and a prior-day signal never executes on the next
+  trading day.
+- Every trading day ends flat. A same-day contract-segment change uses `contract_roll`; session end
+  takes priority over a contract change first observed on the next trading day.
+
+Fees, tax, and slippage apply to all forced exits.
+
+## Windows Lock Safety
+
+Operation locks use `psutil` and verify both PID existence and process creation time. This avoids
+PID-reuse false positives and never probes with `os.kill(pid, 0)` on Windows. `AccessDenied` is
+treated conservatively as active; no health check or cleanup operation terminates a process.
+
 ## Capital And Diagnostics
 
 Initial accounting cash sets starting equity only. V1 uses fixed target positions and
@@ -141,6 +168,20 @@ the same persisted result during one Streamlit rerun. Dynamic result run IDs are
 they are used in element keys. If Streamlit serves stale cached state during local development,
 stop the process and start the application again before repeating the workflow.
 
+Task 13 includes a repository-native Python Playwright acceptance suite. It starts Streamlit and
+Chromium against isolated deterministic data, clicks the eight workflow controls, verifies desktop
+alignment, partial-sync warning behavior, zero-trade diagnostics, trading charts/tables, restart
+restoration, and a true no-op second run. It never substitutes mocked Streamlit calls for browser
+actions and does not require live TAIFEX access in CI.
+
+```powershell
+python -m playwright install chromium
+python -m pytest -q -m "not e2e"
+python -m pytest -q tests/e2e --browser chromium --tracing retain-on-failure
+```
+
+Browser screenshots, traces, and terminal reports are written under ignored `artifacts/` paths.
+
 Task 1 completed: project bootstrap.
 Task 2 completed: config loading and validation.
 Task 3 completed: data schemas and Parquet storage helpers.
@@ -155,7 +196,8 @@ V1 hardening 10.1 completed: explicit official TAIFEX recent trading-day CSV syn
 V1 final hardening Task 11 completed: contract integrity, runtime safety, incremental manifests,
 progress UX, and reproducible diagnostics.
 Task 12 completed: final correctness, transaction safety, shared locking, and linear workflow.
-Current next task: V1 review and refinement before any later version work.
+Current task: Task 13 — V1 final release acceptance. V2 remains blocked until all local, browser,
+official-data, and Windows/Ubuntu CI checks pass.
 
 The `sync-taifex` command retrieves the most recent official TAIFEX futures time-and-sales CSV files advertised by the public previous-30-trading-day page. The limit means the most recent available trading days, not calendar days. Official files may contain all futures products; the existing V1 importer filters the data to TMF. Downloaded raw data and `download_manifest.json` remain local under `data/raw/taifex/` and are ignored by git. Network availability and official page structure can affect syncing, so manual `import-taifex` remains supported as a fallback.
 
@@ -174,3 +216,17 @@ tests/          unit and integration tests
 ## Safety
 
 This project is for quantitative research and software development only. Historical backtest results do not guarantee future performance. No live trading functionality belongs in V1.
+
+## Common Issues
+
+- A workflow step remains `⚠`: read the shared status card; later steps stay disabled until the
+  current disk state validates.
+- A plan becomes pending after files change: rerun Plan so its raw-directory fingerprint is current.
+- Sync partially fails: retry Sync; successful valid files are reused and failed files remain
+  explicit.
+- A result disappears after restart: its fingerprint no longer matches the current config/data, or
+  a required persisted artifact is missing or unreadable.
+- A lock remains after a crash: run `tifq doctor`, then `tifq clean --apply-safe`; active owners are
+  preserved.
+- Streamlit appears stale during development: stop the process and restart the app before repeating
+  acceptance checks.

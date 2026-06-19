@@ -6,7 +6,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from tifq.cli import app
+from tifq.cli import _workflow_cli_marker, app
 from tifq.data.taifex_fetcher import (
     TaifexDownloadPlan,
     TaifexDownloadPlanItem,
@@ -110,6 +110,15 @@ def test_workflow_help_lists_stop_and_machine_readable_options() -> None:
     assert "--stop-after" in result.stdout
     assert "--quiet" in result.stdout
     assert "--json" in result.stdout
+
+
+def test_workflow_markers_are_safe_on_windows_legacy_code_pages() -> None:
+    markers = " ".join(
+        _workflow_cli_marker(status) for status in ("complete", "warning", "running")
+    )
+
+    assert markers.encode("gbk")
+    assert markers.encode("cp950")
 
 
 def test_workflow_can_stop_after_doctor_with_json(tmp_path: Path, monkeypatch) -> None:

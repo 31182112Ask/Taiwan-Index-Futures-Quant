@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, time
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -65,6 +65,7 @@ class BacktestEngine:
         allow_short: bool = True,
         max_trades_per_day: int | None = None,
         assumed_margin_per_contract: float | None = None,
+        force_flatten_time: time = time(13, 35),
     ) -> None:
         if max_position < 0:
             raise ValueError("max_position must be non-negative")
@@ -76,6 +77,7 @@ class BacktestEngine:
         self.allow_short = allow_short
         self.max_trades_per_day = max_trades_per_day
         self.assumed_margin_per_contract = assumed_margin_per_contract
+        self.force_flatten_time = force_flatten_time
         self.rejection_counts: dict[str, int] = {}
 
     @classmethod
@@ -93,6 +95,9 @@ class BacktestEngine:
             allow_short=config.portfolio.allow_short,
             max_trades_per_day=_optional_int(config.strategy.params.get("max_trades_per_day")),
             assumed_margin_per_contract=config.portfolio.assumed_margin_per_contract,
+            force_flatten_time=time.fromisoformat(
+                str(config.strategy.params.get("force_flatten_time", "13:35:00"))
+            ),
         )
 
     def run(self, bars: pd.DataFrame, signals: pd.DataFrame) -> BacktestResult:
@@ -107,13 +112,18 @@ class BacktestEngine:
         portfolio = Portfolio(self.initial_cash)
         trade_counts: dict[date, int] = {}
         equity_rows: list[dict[str, Any]] = []
+        daily_exits = _daily_exit_points(working_bars, self.force_flatten_time)
 
         for index, (_, bar) in enumerate(working_bars.iterrows()):
             timestamp = pd.Timestamp(bar["timestamp"])
             if index > 0:
                 signal = working_signals.iloc[index - 1]
                 previous_bar = working_bars.iloc[index - 1]
-                if _segment_identity(previous_bar) != _segment_identity(bar):
+                previous_timestamp = pd.Timestamp(previous_bar["timestamp"])
+                same_trading_day = previous_timestamp.date() == timestamp.date()
+                if not same_trading_day:
+                    self._record_rejection("trading_day_boundary")
+                elif _segment_identity(previous_bar) != _segment_identity(bar):
                     if portfolio.current_position != 0:
                         portfolio.close(
                             timestamp=pd.Timestamp(previous_bar["timestamp"]),
@@ -128,11 +138,40 @@ class BacktestEngine:
                             self.cost_model.point_value,
                         )
                     self._record_rejection("segment_boundary")
+                elif timestamp.time() >= self.force_flatten_time:
+                    self._record_rejection("session_boundary")
                 else:
                     self._execute_signal(portfolio, signal, bar, trade_counts)
+
+            exit_index, exact_cutoff = daily_exits[timestamp.date()]
+            if exact_cutoff and index == exit_index and portfolio.current_position != 0:
+                portfolio.close(
+                    timestamp=timestamp,
+                    raw_price=float(bar["open"]),
+                    cost_model=self.cost_model,
+                    reason="session_end",
+                )
             equity_rows.append(
                 _equity_row(portfolio, timestamp, float(bar["close"]), self.cost_model.point_value)
             )
+
+            if (
+                not exact_cutoff
+                and index == exit_index
+                and portfolio.current_position != 0
+            ):
+                portfolio.close(
+                    timestamp=timestamp,
+                    raw_price=float(bar["close"]),
+                    cost_model=self.cost_model,
+                    reason="session_end_fallback",
+                )
+                equity_rows[-1] = _equity_row(
+                    portfolio,
+                    timestamp,
+                    float(bar["close"]),
+                    self.cost_model.point_value,
+                )
 
         if portfolio.current_position != 0:
             final_bar = working_bars.iloc[-1]
@@ -140,7 +179,7 @@ class BacktestEngine:
                 timestamp=pd.Timestamp(final_bar["timestamp"]),
                 raw_price=float(final_bar["close"]),
                 cost_model=self.cost_model,
-                reason="end_of_data",
+                reason="session_end_fallback",
             )
             equity_rows[-1] = _equity_row(
                 portfolio,
@@ -419,6 +458,27 @@ def _segment_identity(row: pd.Series) -> tuple[str, str, str]:
         str(row["contract"]),
         str(row["contract_segment_id"]),
     )
+
+
+def _daily_exit_points(
+    bars: pd.DataFrame,
+    cutoff: time,
+) -> dict[date, tuple[int, bool]]:
+    """Return each day's deterministic force-flat row and whether it is exact."""
+    positions: dict[date, list[tuple[int, time]]] = {}
+    for index, raw_timestamp in enumerate(bars["timestamp"]):
+        timestamp = pd.Timestamp(raw_timestamp)
+        positions.setdefault(timestamp.date(), []).append((index, timestamp.time()))
+
+    exits: dict[date, tuple[int, bool]] = {}
+    for trading_day, rows in positions.items():
+        exact = [index for index, bar_time in rows if bar_time == cutoff]
+        if exact:
+            exits[trading_day] = (exact[0], True)
+            continue
+        before = [index for index, bar_time in rows if bar_time < cutoff]
+        exits[trading_day] = (before[-1] if before else rows[0][0], False)
+    return exits
 
 
 def _equity_row(

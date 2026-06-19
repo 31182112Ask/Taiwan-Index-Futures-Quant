@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import pandas as pd
+
 from tifq.backtest import BacktestPreflight, build_data_fingerprint
 from tifq.config.models import BacktestConfig
-from tifq.data.taifex_fetcher import TaifexDownloadPlan, build_taifex_download_plan
+from tifq.data.taifex_fetcher import (
+    TaifexDownloadPlan,
+    TaifexRemoteFile,
+    build_taifex_download_plan,
+)
 from tifq.runtime.health import HealthReport
 from tifq.runtime.manifests import sha256_file
 
@@ -46,6 +53,8 @@ REQUIRED_RESULT_ARTIFACTS = (
     "timings.json",
     "data_fingerprint.json",
 )
+WORKFLOW_STATE_SCHEMA_VERSION = 1
+PLAN_MAX_AGE = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -97,10 +106,8 @@ def derive_workflow_state(
     *,
     plan: TaifexDownloadPlan | None = None,
     plan_raw_fingerprint: tuple[tuple[str, int, int], ...] | None = None,
-    sync_complete: bool = False,
     preflight: BacktestPreflight | None = None,
     latest_run_dir: str | Path | None = None,
-    result_loaded: bool = False,
     running_step: int | None = None,
 ) -> WorkflowState:
     """Derive all markers and enabled states from current files and session artifacts."""
@@ -119,7 +126,7 @@ def derive_workflow_state(
     checks = (
         _health_check(health),
         _plan_check(config, plan, plan_raw_fingerprint),
-        validate_sync_state(config, plan, sync_complete),
+        validate_sync_state(config, plan),
         import_check,
         bar_check,
         validate_preflight_state(
@@ -128,7 +135,7 @@ def derive_workflow_state(
             current_fingerprint=current_fingerprint,
         ),
         result_check,
-        WorkflowCheck(result_loaded and result_check.complete),
+        result_check,
     )
     steps: list[WorkflowStepState] = []
     previous_allows_next = True
@@ -169,6 +176,110 @@ def raw_directory_fingerprint(raw_dir: str | Path) -> tuple[tuple[str, int, int]
     )
 
 
+def persist_workflow_plan(
+    config: BacktestConfig,
+    plan: TaifexDownloadPlan,
+    *,
+    requested_limit: int,
+) -> Path:
+    """Persist a verifiable download-plan index for restart recovery."""
+    state_path = _workflow_state_path(config)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": WORKFLOW_STATE_SCHEMA_VERSION,
+        "created_at": datetime.now(tz=UTC).isoformat(),
+        "requested_limit": requested_limit,
+        "context": _plan_context(config),
+        "raw_directory_fingerprint": [
+            list(item) for item in raw_directory_fingerprint(config.data.raw_dir)
+        ],
+        "items": [
+            {
+                "trading_date": item.remote.trading_date.isoformat(),
+                "download_url": item.remote.download_url,
+                "remote_filename": item.remote.remote_filename,
+                "local_path": str(item.local_path.resolve()),
+            }
+            for item in plan.items
+        ],
+    }
+    temporary = state_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(state_path)
+    return state_path
+
+
+def load_persisted_workflow_plan(
+    config: BacktestConfig,
+    *,
+    now: datetime | None = None,
+) -> tuple[TaifexDownloadPlan | None, tuple[tuple[str, int, int], ...] | None]:
+    """Restore a current plan only when context, age, and raw fingerprint match."""
+    payload = _json_object(_workflow_state_path(config))
+    if payload.get("schema_version") != WORKFLOW_STATE_SCHEMA_VERSION:
+        return None, None
+    if payload.get("context") != _plan_context(config):
+        return None, None
+    try:
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
+    except (KeyError, ValueError):
+        return None, None
+    current_time = now or datetime.now(tz=UTC)
+    if created_at.tzinfo is None or current_time - created_at > PLAN_MAX_AGE:
+        return None, None
+    stored_fingerprint = _decode_raw_fingerprint(payload.get("raw_directory_fingerprint"))
+    current_fingerprint = raw_directory_fingerprint(config.data.raw_dir)
+    if stored_fingerprint is None or stored_fingerprint != current_fingerprint:
+        return None, None
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None, None
+    try:
+        remotes = [
+            TaifexRemoteFile(
+                trading_date=datetime.fromisoformat(str(item["trading_date"])).date(),
+                download_url=str(item["download_url"]),
+                remote_filename=str(item["remote_filename"]),
+            )
+            for item in raw_items
+            if isinstance(item, dict)
+        ]
+    except (KeyError, ValueError):
+        return None, None
+    if len(remotes) != len(raw_items):
+        return None, None
+    plan = build_taifex_download_plan(config.data.raw_dir, remotes)
+    expected_paths = {str(Path(str(item["local_path"])).resolve()) for item in raw_items}
+    if {str(item.local_path.resolve()) for item in plan.items} != expected_paths:
+        return None, None
+    return plan, current_fingerprint
+
+
+def discover_latest_matching_result(config: BacktestConfig) -> Path | None:
+    """Find the newest complete result whose fingerprint matches current config/data."""
+    root = config.data.processed_dir.parent / "results" / "backtests"
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        (path for path in root.glob("*/*") if path.is_dir()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    current_fingerprint = build_data_fingerprint(config)
+    return next(
+        (
+            path
+            for path in candidates
+            if validate_result_state(
+                config,
+                path,
+                current_fingerprint=current_fingerprint,
+            ).complete
+        ),
+        None,
+    )
+
+
 def validate_import_state(
     config: BacktestConfig,
     plan: TaifexDownloadPlan | None = None,
@@ -200,14 +311,20 @@ def validate_import_state(
 def validate_sync_state(
     config: BacktestConfig,
     plan: TaifexDownloadPlan | None,
-    sync_complete: bool,
 ) -> WorkflowCheck:
     """Validate selected official files against the current download manifest and hashes."""
-    if not sync_complete or plan is None:
+    if plan is None:
         return WorkflowCheck(False)
     current = build_taifex_download_plan(config.data.raw_dir, [item.remote for item in plan.items])
-    if not current.items or any(item.status != "valid_existing" for item in current.items):
-        return WorkflowCheck(False, blocking_reason="download manifest or file hash mismatch")
+    invalid = [item for item in current.items if item.status != "valid_existing"]
+    if not current.items or invalid:
+        details = ", ".join(
+            f"{item.remote.trading_date.isoformat()}={item.status}" for item in invalid
+        )
+        return WorkflowCheck(
+            False,
+            blocking_reason=f"sync incomplete: {len(invalid)} selected file(s) invalid ({details})",
+        )
     return WorkflowCheck(True)
 
 
@@ -287,9 +404,14 @@ def validate_result_state(
         return WorkflowCheck(False, blocking_reason="result artifacts are incomplete")
     fingerprint = _json_object(root / "data_fingerprint.json")
     fingerprint_now = current_fingerprint or build_data_fingerprint(config)
+    readable = _result_artifacts_readable(root)
     return WorkflowCheck(
-        fingerprint == fingerprint_now,
-        blocking_reason=(None if fingerprint == fingerprint_now else "result fingerprint is stale"),
+        fingerprint == fingerprint_now and readable,
+        blocking_reason=(
+            "result fingerprint is stale"
+            if fingerprint != fingerprint_now
+            else (None if readable else "result artifacts are corrupt or unreadable")
+        ),
     )
 
 
@@ -340,3 +462,36 @@ def _json_object(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _workflow_state_path(config: BacktestConfig) -> Path:
+    return config.data.processed_dir.parent / ".runtime" / "workflow_state.json"
+
+
+def _plan_context(config: BacktestConfig) -> dict[str, str]:
+    return {
+        "raw_dir": str(config.data.raw_dir.resolve()),
+        "symbol": config.data.symbol,
+        "session": config.data.session,
+    }
+
+
+def _decode_raw_fingerprint(value: object) -> tuple[tuple[str, int, int], ...] | None:
+    if not isinstance(value, list):
+        return None
+    try:
+        return tuple((str(item[0]), int(item[1]), int(item[2])) for item in value)
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _result_artifacts_readable(root: Path) -> bool:
+    try:
+        metrics = _json_object(root / "metrics.json")
+        diagnostics = _json_object(root / "diagnostics.json")
+        pd.read_csv(root / "trades.csv")
+        pd.read_csv(root / "equity_curve.csv")
+        pd.read_parquet(root / "model_bars.parquet")
+    except (OSError, ValueError):
+        return False
+    return bool(metrics) and bool(diagnostics)

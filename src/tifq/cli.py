@@ -521,7 +521,7 @@ def workflow(
     def record(step: str, status: str, message: str) -> None:
         records.append({"step": step, "status": status, "message": message})
         if not quiet and not json_output:
-            marker = {"complete": "✅", "warning": "⚠", "running": "…"}.get(status, "-")
+            marker = _workflow_cli_marker(status)
             typer.echo(f"[{marker}] {step}: {message}")
 
     try:
@@ -631,6 +631,11 @@ def workflow(
 def _finish_workflow(records: list[dict[str, object]], json_output: bool) -> None:
     if json_output:
         typer.echo(json.dumps({"steps": records}, ensure_ascii=False, indent=2))
+
+
+def _workflow_cli_marker(status: str) -> str:
+    """Return terminal markers safe on Windows legacy code pages."""
+    return {"complete": "OK", "warning": "WARN", "running": "..."}.get(status, "-")
 
 
 def _print_taifex_fetch_summary(fetch_summary: TaifexFetchSummary) -> None:

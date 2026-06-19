@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-and-integration:
+    name: ${{ matrix.os }} / Python 3.11
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Mypy
+        run: python -m mypy src
+      - name: Pytest
+        run: python -m pytest -q -m "not e2e"
+
+  browser-e2e:
+    name: windows-latest / Chromium E2E
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Install Chromium
+        run: python -m playwright install chromium
+      - name: Browser E2E
+        run: python -m pytest -q tests/e2e --browser chromium --tracing retain-on-failure
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-e2e-evidence
+          if-no-files-found: warn
+          path: |
+            artifacts/ui/v1-final/
+            artifacts/validation/v1-final/
+            test-results/

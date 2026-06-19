@@ -10,6 +10,7 @@ import pytest
 
 from tifq.data.taifex_fetcher import (
     TAIFEX_RECENT_FUTURES_URL,
+    TaifexFetchError,
     build_taifex_download_plan,
     discover_recent_taifex_csv_files,
     plan_recent_taifex_csv_files,
@@ -182,6 +183,18 @@ def test_discovery_retries_http_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert attempts == 2
     assert files[0].trading_date.isoformat() == "2026-06-18"
+
+
+def test_retry_failure_preserves_last_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tifq.data.taifex_fetcher.time.sleep", lambda _: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+    with pytest.raises(TaifexFetchError, match="last error:.*retryable status 500"):
+        discover_recent_taifex_csv_files(limit=1, client=client)
 
 
 @pytest.mark.parametrize("limit", [0, 31])
