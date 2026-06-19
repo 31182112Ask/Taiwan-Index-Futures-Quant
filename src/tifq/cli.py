@@ -1,5 +1,7 @@
 """Command line interface for the V1 Backtest Lab."""
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -75,7 +77,7 @@ def init_project() -> None:
         typer.echo(f"  {status} {config_file}")
 
     typer.secho(
-        "Bootstrap complete. Next milestone: Task 10 - Streamlit Backtest Lab.",
+        "Bootstrap complete. V1 Backtest Lab modules are implemented through Task 10.",
         fg=typer.colors.GREEN,
     )
 
@@ -200,9 +202,31 @@ def backtest(
 
 
 @app_group.command("backtest-lab")
-def backtest_lab() -> None:
-    """Start the Streamlit Backtest Lab. Placeholder until Task 10."""
-    _not_implemented("Streamlit Backtest Lab", "Task 10 - Streamlit Backtest Lab")
+def backtest_lab(
+    host: Annotated[
+        str,
+        typer.Option(help="Streamlit server host."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(help="Streamlit server port."),
+    ] = 8501,
+) -> None:
+    """Start the local Streamlit Backtest Lab client."""
+    app_path = Path(__file__).parent / "apps" / "backtest_lab.py"
+    typer.secho(f"Starting Streamlit Backtest Lab at http://{host}:{port}", fg=typer.colors.GREEN)
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.address",
+        host,
+        "--server.port",
+        str(port),
+    ]
+    raise typer.Exit(code=subprocess.run(command, check=False).returncode)
 
 
 if __name__ == "__main__":

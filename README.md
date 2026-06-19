@@ -54,9 +54,10 @@ Task 6 completed: EMA, VWAP, ATR, and realized volatility indicators.
 Task 7 completed: strategy interface and VWAP Trend signals.
 Task 8 completed: conservative next-bar-open backtest engine.
 Task 9 completed: metrics calculation and persisted result files.
-Current next task: Task 10 - Streamlit Backtest Lab.
+Task 10 completed: local Streamlit Backtest Lab.
+Current next task: V1 review and refinement before any later version work.
 
-The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command validates `configs/v1_backtest.yaml`, loads configured bar Parquet files, calculates indicators, generates VWAP Trend signals, runs conservative next-bar-open execution, and writes `config.yaml`, `trades.csv`, `equity_curve.csv`, and `metrics.json` under `data/results/backtests/<strategy_name>/<run_id>/`. The Streamlit UI is implemented in a later task.
+The `import-taifex` command imports local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files. The `build-bars` command converts cleaned ticks into 1m or 5m OHLCV bar files. The `backtest` command validates `configs/v1_backtest.yaml`, loads configured bar Parquet files, calculates indicators, generates VWAP Trend signals, runs conservative next-bar-open execution, and writes `config.yaml`, `trades.csv`, `equity_curve.csv`, and `metrics.json` under `data/results/backtests/<strategy_name>/<run_id>/`. The `app backtest-lab` command starts the local Streamlit client for import, bar building, strategy parameter edits, backtest runs, charts, trades, and saved result browsing.
 
 ## Project Layout
 
