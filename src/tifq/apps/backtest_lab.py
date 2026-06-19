@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yaml
 
 from tifq.backtest import (
     BacktestResult,
@@ -46,6 +47,16 @@ class ResultRun:
     run_id: str
     run_dir: Path
     modified_time: float
+
+
+@dataclass(frozen=True)
+class LoadedResultRun:
+    """Persisted run files loaded for browsing and comparison."""
+
+    config: dict[str, Any]
+    metrics: dict[str, MetricValue]
+    trades: pd.DataFrame
+    equity_curve: pd.DataFrame
 
 
 def main() -> None:
@@ -146,13 +157,46 @@ def discover_result_runs(
 
 def load_result_run(
     run_dir: str | Path,
-) -> tuple[dict[str, MetricValue], pd.DataFrame, pd.DataFrame]:
-    """Load metrics, trades, and equity curve from a persisted result run."""
+) -> LoadedResultRun:
+    """Load config, metrics, trades, and equity curve from a persisted result run."""
     path = Path(run_dir)
+    config_payload = yaml.safe_load((path / "config.yaml").read_text(encoding="utf-8"))
+    if not isinstance(config_payload, dict):
+        raise ValueError(f"result config must be a YAML mapping: {path / 'config.yaml'}")
     metrics = json.loads((path / "metrics.json").read_text(encoding="utf-8"))
     trades = pd.read_csv(path / "trades.csv")
     equity_curve = pd.read_csv(path / "equity_curve.csv")
-    return metrics, trades, equity_curve
+    return LoadedResultRun(
+        config=config_payload,
+        metrics=metrics,
+        trades=trades,
+        equity_curve=equity_curve,
+    )
+
+
+def build_run_comparison_table(runs: list[tuple[ResultRun, LoadedResultRun]]) -> pd.DataFrame:
+    """Build a compact parameter and metric comparison table for 2-5 result runs."""
+    records = [_comparison_record(run, loaded) for run, loaded in runs]
+    return pd.DataFrame(
+        records,
+        columns=[
+            "run_id",
+            "date_range",
+            "timeframe",
+            "ema_fast",
+            "ema_slow",
+            "atr_period",
+            "atr_stop_mult",
+            "take_profit_r",
+            "commission",
+            "slippage",
+            "net_pnl",
+            "max_drawdown",
+            "win_rate",
+            "profit_factor",
+            "trade_count",
+        ],
+    )
 
 
 def build_config_override(
@@ -564,11 +608,30 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
     labels = [f"{run.strategy} / {run.run_id}" for run in runs]
     selected_label = st.selectbox("Run", labels)
     selected = runs[labels.index(selected_label)]
-    metrics, trades, equity_curve = load_result_run(selected.run_dir)
-    _render_result_summary(st, metrics)
-    _render_charts(st, go, equity_curve, trades, pd.DataFrame())
-    st.dataframe(trades, use_container_width=True, hide_index=True)
+    loaded = load_result_run(selected.run_dir)
+    _render_result_summary(st, loaded.metrics)
+    _render_charts(st, go, loaded.equity_curve, loaded.trades, pd.DataFrame())
+    st.dataframe(loaded.trades, use_container_width=True, hide_index=True)
     st.caption(str(selected.run_dir))
+
+    st.write("Run Comparison")
+    default_labels = labels[: min(2, len(labels))]
+    selected_labels = st.multiselect(
+        "Compare runs",
+        labels,
+        default=default_labels,
+        max_selections=5,
+    )
+    if len(selected_labels) < 2:
+        st.info("Select 2 to 5 runs for comparison.")
+        return
+    selected_runs = [runs[labels.index(label)] for label in selected_labels[:5]]
+    loaded_runs = [(run, load_result_run(run.run_dir)) for run in selected_runs]
+    st.dataframe(
+        build_run_comparison_table(loaded_runs),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def _render_result_summary(st: Any, metrics: dict[str, MetricValue]) -> None:
@@ -586,6 +649,41 @@ def _render_result_summary(st: Any, metrics: dict[str, MetricValue]) -> None:
     detail_cols[2].metric("Fee", _money(metrics.get("total_fee", 0)))
     detail_cols[3].metric("Tax", _money(metrics.get("total_tax", 0)))
     detail_cols[4].metric("Slippage", _money(metrics.get("total_slippage", 0)))
+
+
+def _comparison_record(run: ResultRun, loaded: LoadedResultRun) -> dict[str, object]:
+    config = loaded.config
+    data = _mapping(config.get("data"))
+    strategy = _mapping(config.get("strategy"))
+    params = _mapping(strategy.get("params"))
+    cost = _mapping(config.get("cost"))
+    metrics = loaded.metrics
+
+    start_date = str(data.get("start_date", "-"))
+    end_date = str(data.get("end_date", "-"))
+    return {
+        "run_id": run.run_id,
+        "date_range": f"{start_date} to {end_date}",
+        "timeframe": data.get("timeframe", "-"),
+        "ema_fast": params.get("ema_fast", "-"),
+        "ema_slow": params.get("ema_slow", "-"),
+        "atr_period": params.get("atr_period", "-"),
+        "atr_stop_mult": params.get("atr_stop_mult", "-"),
+        "take_profit_r": params.get("take_profit_r", "-"),
+        "commission": cost.get("commission_per_side", "-"),
+        "slippage": cost.get("slippage_points_per_side", "-"),
+        "net_pnl": metrics.get("net_pnl", 0),
+        "max_drawdown": metrics.get("max_drawdown", 0),
+        "win_rate": metrics.get("win_rate", 0),
+        "profit_factor": metrics.get("profit_factor", 0),
+        "trade_count": metrics.get("trade_count", 0),
+    }
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
 
 
 def _render_charts(

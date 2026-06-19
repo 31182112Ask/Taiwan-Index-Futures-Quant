@@ -5,9 +5,12 @@ from datetime import date, time
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 from tifq.apps.backtest_lab import (
+    ResultRun,
     build_config_override,
+    build_run_comparison_table,
     discover_raw_files,
     discover_result_runs,
     load_result_run,
@@ -97,25 +100,115 @@ def test_discover_raw_files_returns_csv_and_zip_only(tmp_path: Path) -> None:
 
 def test_discover_and_load_result_runs(tmp_path: Path) -> None:
     run_dir = tmp_path / "results" / "backtests" / "vwap_trend" / "run-001"
-    run_dir.mkdir(parents=True)
-    (run_dir / "metrics.json").write_text(
-        json.dumps({"final_equity": 100_500.0, "trade_count": 1}),
-        encoding="utf-8",
-    )
-    pd.DataFrame({"exit_reason": ["take_profit"], "net_pnl": [500.0]}).to_csv(
-        run_dir / "trades.csv",
-        index=False,
-    )
-    pd.DataFrame({"timestamp": ["2026-06-17 09:05:00+08:00"], "equity": [100_500.0]}).to_csv(
-        run_dir / "equity_curve.csv",
-        index=False,
-    )
+    write_result_run(run_dir)
 
     runs = discover_result_runs(tmp_path / "results" / "backtests")
-    metrics, trades, equity_curve = load_result_run(runs[0].run_dir)
+    loaded = load_result_run(runs[0].run_dir)
 
     assert runs[0].strategy == "vwap_trend"
     assert runs[0].run_id == "run-001"
-    assert metrics["trade_count"] == 1
-    assert trades.loc[0, "exit_reason"] == "take_profit"
-    assert equity_curve.loc[0, "equity"] == 100_500.0
+    assert loaded.config["data"]["timeframe"] == "5m"
+    assert loaded.metrics["trade_count"] == 1
+    assert loaded.trades.loc[0, "exit_reason"] == "take_profit"
+    assert loaded.equity_curve.loc[0, "equity"] == 100_500.0
+
+
+def test_build_run_comparison_table_includes_required_columns(tmp_path: Path) -> None:
+    run_one = tmp_path / "results" / "backtests" / "vwap_trend" / "run-001"
+    run_two = tmp_path / "results" / "backtests" / "vwap_trend" / "run-002"
+    write_result_run(run_one, ema_fast=20, net_pnl=500.0)
+    write_result_run(run_two, ema_fast=30, net_pnl=-100.0)
+
+    comparison = build_run_comparison_table(
+        [
+            (
+                ResultRun("vwap_trend", "run-001", run_one, 1.0),
+                load_result_run(run_one),
+            ),
+            (
+                ResultRun("vwap_trend", "run-002", run_two, 2.0),
+                load_result_run(run_two),
+            ),
+        ]
+    )
+
+    assert comparison.columns.tolist() == [
+        "run_id",
+        "date_range",
+        "timeframe",
+        "ema_fast",
+        "ema_slow",
+        "atr_period",
+        "atr_stop_mult",
+        "take_profit_r",
+        "commission",
+        "slippage",
+        "net_pnl",
+        "max_drawdown",
+        "win_rate",
+        "profit_factor",
+        "trade_count",
+    ]
+    assert comparison["run_id"].tolist() == ["run-001", "run-002"]
+    assert comparison["date_range"].tolist() == [
+        "2026-06-01 to 2026-06-17",
+        "2026-06-01 to 2026-06-17",
+    ]
+    assert comparison["ema_fast"].tolist() == [20, 30]
+    assert comparison["net_pnl"].tolist() == [500.0, -100.0]
+
+
+def write_result_run(run_dir: Path, *, ema_fast: int = 20, net_pnl: float = 500.0) -> None:
+    run_dir.mkdir(parents=True)
+    config = {
+        "data": {
+            "start_date": "2026-06-01",
+            "end_date": "2026-06-17",
+            "timeframe": "5m",
+        },
+        "strategy": {
+            "params": {
+                "ema_fast": ema_fast,
+                "ema_slow": 60,
+                "atr_period": 14,
+                "atr_stop_mult": 1.5,
+                "take_profit_r": 1.5,
+            }
+        },
+        "cost": {
+            "commission_per_side": 5,
+            "slippage_points_per_side": 1,
+        },
+        "portfolio": {
+            "initial_cash": 100_000,
+            "max_position": 1,
+            "allow_short": True,
+        },
+    }
+    (run_dir / "config.yaml").write_text(
+        yaml.safe_dump(config, sort_keys=False),
+        encoding="utf-8",
+    )
+    (run_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "final_equity": 100_000.0 + net_pnl,
+                "net_pnl": net_pnl,
+                "max_drawdown": 200.0,
+                "win_rate": 0.5,
+                "profit_factor": 1.2,
+                "trade_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame({"exit_reason": ["take_profit"], "net_pnl": [net_pnl]}).to_csv(
+        run_dir / "trades.csv",
+        index=False,
+    )
+    pd.DataFrame(
+        {"timestamp": ["2026-06-17 09:05:00+08:00"], "equity": [100_000.0 + net_pnl]}
+    ).to_csv(
+        run_dir / "equity_curve.csv",
+        index=False,
+    )
