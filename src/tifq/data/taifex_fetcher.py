@@ -55,6 +55,17 @@ class TaifexDownloadRecord:
 
 
 @dataclass(frozen=True)
+class TaifexDownloadFailure:
+    """One failed official download attempt."""
+
+    trading_date: date
+    download_url: str
+    remote_filename: str
+    local_path: Path
+    error: str
+
+
+@dataclass(frozen=True)
 class TaifexFetchSummary:
     """Summary of one recent TAIFEX sync operation."""
 
@@ -63,7 +74,9 @@ class TaifexFetchSummary:
     files_downloaded: int
     files_skipped: int
     files_updated: int
+    files_failed: int
     records: tuple[TaifexDownloadRecord, ...]
+    failures: tuple[TaifexDownloadFailure, ...]
 
 
 def discover_recent_taifex_csv_files(
@@ -76,8 +89,11 @@ def discover_recent_taifex_csv_files(
     owns_client = client is None
     active_client = client or _make_client(60.0)
     try:
-        response = active_client.get(TAIFEX_RECENT_FUTURES_URL, headers=_request_headers())
-        response.raise_for_status()
+        response = _request_with_retries(
+            active_client,
+            TAIFEX_RECENT_FUTURES_URL,
+            "TAIFEX discovery",
+        )
         discovered = parse_recent_taifex_csv_files(response.text, TAIFEX_RECENT_FUTURES_URL)
         return discovered[:limit]
     finally:
@@ -121,32 +137,54 @@ def sync_recent_taifex_csv_files(
     owns_client = client is None
     active_client = client or _make_client(timeout_seconds)
     try:
-        remote_files = discover_recent_taifex_csv_files(limit=limit, client=active_client)
+        discovered_files = discover_recent_taifex_csv_files(
+            limit=MAX_RECENT_FILES,
+            client=active_client,
+        )
+        remote_files = discovered_files[:limit]
         records: list[TaifexDownloadRecord] = []
+        failures: list[TaifexDownloadFailure] = []
         for index, remote_file in enumerate(remote_files):
-            record = _sync_one_file(
-                raw_path,
-                remote_file,
-                client=active_client,
-                manifest_record=records_by_key.get(_manifest_key(remote_file)),
-                overwrite=overwrite,
-            )
+            try:
+                record = _sync_one_file(
+                    raw_path,
+                    remote_file,
+                    client=active_client,
+                    manifest_record=records_by_key.get(_manifest_key(remote_file)),
+                    overwrite=overwrite,
+                )
+            except (OSError, TaifexFetchError) as exc:
+                failures.append(
+                    TaifexDownloadFailure(
+                        trading_date=remote_file.trading_date,
+                        download_url=remote_file.download_url,
+                        remote_filename=remote_file.remote_filename,
+                        local_path=_local_download_path(raw_path, remote_file),
+                        error=str(exc),
+                    )
+                )
+                continue
+
             records.append(record)
-            _upsert_manifest_record(manifest, remote_file, record)
-            if record.status in {"downloaded", "updated"} and index < len(remote_files) - 1:
-                time.sleep(0.1)
+            if record.status in {"downloaded", "updated"}:
+                _upsert_manifest_record(manifest, remote_file, record)
+                _write_manifest(raw_path, manifest)
+                if index < len(remote_files) - 1:
+                    time.sleep(0.1)
     finally:
         if owns_client:
             active_client.close()
 
     _write_manifest(raw_path, manifest)
     return TaifexFetchSummary(
-        files_discovered=len(remote_files),
+        files_discovered=len(discovered_files),
         files_selected=len(remote_files),
         files_downloaded=sum(1 for record in records if record.status == "downloaded"),
         files_skipped=sum(1 for record in records if record.status == "skipped"),
         files_updated=sum(1 for record in records if record.status == "updated"),
+        files_failed=len(failures),
         records=tuple(records),
+        failures=tuple(failures),
     )
 
 
@@ -233,6 +271,10 @@ def _sync_one_file(
             sha256=str(manifest_record["sha256"]),
             status="skipped",
         )
+    if local_path.exists() and not overwrite:
+        raise TaifexFetchError(
+            f"Local TAIFEX file exists without a matching manifest record: {local_path}"
+        )
 
     existing = local_path.exists()
     body, content_type = _download_with_retries(client, remote_file.download_url)
@@ -259,22 +301,27 @@ def _sync_one_file(
 
 
 def _download_with_retries(client: httpx.Client, url: str) -> tuple[bytes, str]:
+    response = _request_with_retries(client, url, "TAIFEX download")
+    return response.content, response.headers.get("content-type", "")
+
+
+def _request_with_retries(client: httpx.Client, url: str, label: str) -> httpx.Response:
     last_error: Exception | None = None
     for attempt in range(MAX_DOWNLOAD_ATTEMPTS):
         try:
             response = client.get(url, headers=_request_headers())
             if response.status_code == 429 or response.status_code >= 500:
                 raise TaifexFetchError(
-                    f"TAIFEX download returned retryable status {response.status_code}: {url}"
+                    f"{label} returned retryable status {response.status_code}: {url}"
                 )
             response.raise_for_status()
-            return response.content, response.headers.get("content-type", "")
+            return response
         except (httpx.TransportError, httpx.HTTPStatusError, TaifexFetchError) as exc:
             last_error = exc
             if attempt == MAX_DOWNLOAD_ATTEMPTS - 1:
                 break
             time.sleep(0.2 * (2**attempt))
-    raise TaifexFetchError(f"TAIFEX download failed after retries: {url}") from last_error
+    raise TaifexFetchError(f"{label} failed after retries: {url}") from last_error
 
 
 def _validate_download_body(body: bytes, content_type: str, filename: str) -> None:

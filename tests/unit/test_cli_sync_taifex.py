@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from tifq.cli import app
 from tifq.data.taifex_fetcher import (
+    TaifexDownloadFailure,
     TaifexDownloadRecord,
     TaifexFetchSummary,
 )
@@ -31,6 +32,7 @@ def fetch_summary(tmp_path: Path) -> TaifexFetchSummary:
         files_downloaded=1,
         files_skipped=0,
         files_updated=0,
+        files_failed=0,
         records=(
             TaifexDownloadRecord(
                 trading_date=date(2026, 6, 18),
@@ -41,6 +43,7 @@ def fetch_summary(tmp_path: Path) -> TaifexFetchSummary:
                 status="downloaded",
             ),
         ),
+        failures=(),
     )
 
 
@@ -114,6 +117,36 @@ def test_sync_taifex_cli_download_only_stops_before_import(tmp_path: Path, monke
     assert result.exit_code == 0
     assert calls == ["sync"]
     assert "Clean TMF ticks" not in result.stdout
+
+
+def test_sync_taifex_cli_reports_partial_download_failure(tmp_path: Path, monkeypatch) -> None:
+    def fake_sync(raw_dir: Path, **kwargs: object) -> TaifexFetchSummary:
+        return TaifexFetchSummary(
+            files_discovered=2,
+            files_selected=2,
+            files_downloaded=1,
+            files_skipped=0,
+            files_updated=0,
+            files_failed=1,
+            records=fetch_summary(tmp_path).records,
+            failures=(
+                TaifexDownloadFailure(
+                    trading_date=date(2026, 6, 17),
+                    download_url="https://www.taifex.com.tw/file/Daily_20260617.csv",
+                    remote_filename="Daily_20260617.csv",
+                    local_path=tmp_path / "official" / "2026-06-17" / "Daily_20260617.csv",
+                    error="HTML error page",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("tifq.cli.sync_recent_taifex_csv_files", fake_sync)
+
+    result = CliRunner().invoke(app, ["sync-taifex", "--raw-dir", str(tmp_path / "raw")])
+
+    assert result.exit_code == 1
+    assert "Failed: 1" in result.stdout
+    assert "HTML error page" in result.stdout
 
 
 def test_sync_taifex_cli_rejects_invalid_symbol_timeframe_and_limit() -> None:

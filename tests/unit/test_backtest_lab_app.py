@@ -9,6 +9,7 @@ import yaml
 
 from tifq.apps.backtest_lab import (
     ResultRun,
+    _load_chart_bars,
     build_config_override,
     build_run_comparison_table,
     discover_raw_files,
@@ -156,6 +157,56 @@ def test_build_run_comparison_table_includes_required_columns(tmp_path: Path) ->
     ]
     assert comparison["ema_fast"].tolist() == [20, 30]
     assert comparison["net_pnl"].tolist() == [500.0, -100.0]
+
+
+def test_load_chart_bars_calculates_indicators_before_tail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-06-17 08:45:00",
+                periods=600,
+                freq="min",
+                tz="Asia/Taipei",
+            ),
+            "symbol": ["TMF"] * 600,
+            "contract": ["202606"] * 600,
+            "timeframe": ["1m"] * 600,
+            "open": list(range(600)),
+            "high": list(range(1, 601)),
+            "low": list(range(600)),
+            "close": list(range(600)),
+            "volume": [1] * 600,
+        }
+    )
+    observed_lengths: list[int] = []
+
+    def fake_load_configured_bars(config: BacktestConfig) -> pd.DataFrame:
+        return bars
+
+    def fake_append_basic_indicators(input_bars: pd.DataFrame, **kwargs: object) -> pd.DataFrame:
+        observed_lengths.append(len(input_bars))
+        result = input_bars.copy()
+        result["ema_fast"] = range(len(result))
+        result["ema_slow"] = range(len(result))
+        result["vwap"] = range(len(result))
+        result["atr"] = range(len(result))
+        result["realized_volatility"] = range(len(result))
+        return result
+
+    monkeypatch.setattr("tifq.apps.backtest_lab.load_configured_bars", fake_load_configured_bars)
+    monkeypatch.setattr(
+        "tifq.apps.backtest_lab.append_basic_indicators",
+        fake_append_basic_indicators,
+    )
+
+    chart_bars = _load_chart_bars(base_config(tmp_path))
+
+    assert observed_lengths == [600]
+    assert len(chart_bars) == 500
+    assert chart_bars.loc[0, "ema_fast"] == 100
 
 
 def write_result_run(run_dir: Path, *, ema_fast: int = 20, net_pnl: float = 500.0) -> None:

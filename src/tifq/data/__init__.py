@@ -10,6 +10,7 @@ from tifq.data.schemas import (
 from tifq.data.storage import bar_path, read_parquet, tick_path, write_parquet
 from tifq.data.taifex_fetcher import (
     TAIFEX_RECENT_FUTURES_URL,
+    TaifexDownloadFailure,
     TaifexDownloadRecord,
     TaifexFetchError,
     TaifexFetchSummary,
@@ -27,6 +28,7 @@ __all__ = [
     "TAIFEX_RECENT_FUTURES_URL",
     "SchemaValidationError",
     "TaifexDownloadRecord",
+    "TaifexDownloadFailure",
     "TaifexFetchError",
     "TaifexFetchSummary",
     "TaifexImportError",

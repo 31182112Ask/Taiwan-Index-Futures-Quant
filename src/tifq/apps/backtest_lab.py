@@ -24,7 +24,11 @@ from tifq.config import ConfigLoadError, load_backtest_config
 from tifq.config.models import BacktestConfig
 from tifq.data import import_taifex_ticks
 from tifq.data.storage import read_parquet
-from tifq.data.taifex_fetcher import TaifexFetchSummary, sync_recent_taifex_csv_files
+from tifq.data.taifex_fetcher import (
+    TaifexFetchError,
+    TaifexFetchSummary,
+    sync_recent_taifex_csv_files,
+)
 from tifq.indicators import append_basic_indicators
 
 
@@ -105,7 +109,7 @@ def discover_raw_files(raw_dir: str | Path) -> list[Path]:
         return []
     return sorted(
         path
-        for path in raw_path.iterdir()
+        for path in raw_path.rglob("*")
         if path.is_file() and path.suffix.lower() in {".csv", ".zip"}
     )
 
@@ -485,11 +489,15 @@ def _render_official_sync(st: Any, config: BacktestConfig) -> None:
                 symbol=config.data.symbol,
                 timeframe=config.data.timeframe,
             )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TaifexFetchError) as exc:
         status.update(label=f"TAIFEX sync failed: {exc}", state="error")
         return
 
-    status.update(label="Official TAIFEX sync completed.", state="complete")
+    state = "error" if fetch_summary.files_failed else "complete"
+    label = "Official TAIFEX sync completed with failures." if fetch_summary.files_failed else (
+        "Official TAIFEX sync completed."
+    )
+    status.update(label=label, state=state)
     st.json(_sync_display_payload(fetch_summary, import_summary, bar_summary))
 
 
@@ -505,7 +513,15 @@ def _sync_display_payload(
         "downloaded": fetch_summary.files_downloaded,
         "skipped": fetch_summary.files_skipped,
         "updated": fetch_summary.files_updated,
-        "failed": 0,
+        "failed": fetch_summary.files_failed,
+        "failures": [
+            {
+                "trading_date": failure.trading_date.isoformat(),
+                "local_path": str(failure.local_path),
+                "error": failure.error,
+            }
+            for failure in fetch_summary.failures
+        ],
         "latest_available_trading_date": max(dates).isoformat() if dates else "-",
         "earliest_available_trading_date": min(dates).isoformat() if dates else "-",
         "download_paths": [str(record.local_path) for record in fetch_summary.records],
@@ -845,13 +861,14 @@ def _load_chart_bars(config: BacktestConfig) -> pd.DataFrame:
     try:
         bars = load_configured_bars(config)
         params: dict[str, object] = dict(config.strategy.params)
-        return append_basic_indicators(
-            bars.tail(500),
+        enriched = append_basic_indicators(
+            bars,
             ema_fast=_int_param(params, "ema_fast", 20),
             ema_slow=_int_param(params, "ema_slow", 60),
             atr_period=_int_param(params, "atr_period", 14),
             volatility_window=_int_param(params, "volatility_window", 20),
         )
+        return enriched.tail(500).reset_index(drop=True)
     except (OSError, ValueError):
         return pd.DataFrame()
 

@@ -12,7 +12,12 @@ from tifq import __version__
 from tifq.backtest import persist_backtest_result, run_backtest_from_config
 from tifq.bars import build_bar_files
 from tifq.config import ConfigLoadError, load_backtest_config
-from tifq.data import import_taifex_ticks, sync_recent_taifex_csv_files
+from tifq.data import (
+    TaifexFetchError,
+    TaifexFetchSummary,
+    import_taifex_ticks,
+    sync_recent_taifex_csv_files,
+)
 
 app = typer.Typer(
     help="Taiwan Index Futures Quant - V1 Backtest Lab CLI.",
@@ -203,25 +208,24 @@ def sync_taifex(
             limit=limit,
             overwrite=overwrite,
         )
-        import_summary = None
-        bar_summary = None
+    except (OSError, ValueError, TaifexFetchError) as exc:
+        typer.secho(f"TAIFEX sync failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    _print_taifex_fetch_summary(fetch_summary)
+    if fetch_summary.files_failed:
+        raise typer.Exit(code=1)
+
+    import_summary = None
+    bar_summary = None
+    try:
         if not download_only:
             import_summary = import_taifex_ticks(raw_dir, processed_dir, symbol=symbol)
             bar_summary = build_bar_files(processed_dir, symbol=symbol, timeframe=timeframe)
     except (OSError, ValueError) as exc:
-        typer.secho(f"TAIFEX sync failed: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(f"TAIFEX import or bar build failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
-    typer.secho("Official TAIFEX sync completed.", fg=typer.colors.GREEN)
-    typer.echo(f"Remote files discovered: {fetch_summary.files_discovered}")
-    typer.echo(f"Files selected: {fetch_summary.files_selected}")
-    typer.echo(f"Downloaded: {fetch_summary.files_downloaded}")
-    typer.echo(f"Skipped: {fetch_summary.files_skipped}")
-    typer.echo(f"Updated: {fetch_summary.files_updated}")
-    if fetch_summary.records:
-        typer.echo("Download records:")
-        for record in fetch_summary.records:
-            typer.echo(f"  {record.trading_date} {record.status} {record.local_path}")
     if import_summary is not None:
         typer.echo(f"Clean TMF ticks: {import_summary.output_tick_count}")
         typer.echo(f"Invalid or filtered rows: {import_summary.invalid_row_count}")
@@ -270,6 +274,24 @@ def backtest(
     typer.echo(f"  {report_paths.trades_path}")
     typer.echo(f"  {report_paths.equity_curve_path}")
     typer.echo(f"  {report_paths.metrics_path}")
+
+
+def _print_taifex_fetch_summary(fetch_summary: TaifexFetchSummary) -> None:
+    typer.secho("Official TAIFEX sync completed.", fg=typer.colors.GREEN)
+    typer.echo(f"Remote files discovered: {fetch_summary.files_discovered}")
+    typer.echo(f"Files selected: {fetch_summary.files_selected}")
+    typer.echo(f"Downloaded: {fetch_summary.files_downloaded}")
+    typer.echo(f"Skipped: {fetch_summary.files_skipped}")
+    typer.echo(f"Updated: {fetch_summary.files_updated}")
+    typer.echo(f"Failed: {fetch_summary.files_failed}")
+    if fetch_summary.records:
+        typer.echo("Download records:")
+        for record in fetch_summary.records:
+            typer.echo(f"  {record.trading_date} {record.status} {record.local_path}")
+    if fetch_summary.failures:
+        typer.echo("Download failures:")
+        for failure in fetch_summary.failures:
+            typer.echo(f"  {failure.trading_date} failed {failure.local_path}: {failure.error}")
 
 
 @app_group.command("backtest-lab")
