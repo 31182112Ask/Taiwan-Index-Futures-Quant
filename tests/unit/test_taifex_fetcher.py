@@ -10,7 +10,9 @@ import pytest
 
 from tifq.data.taifex_fetcher import (
     TAIFEX_RECENT_FUTURES_URL,
+    build_taifex_download_plan,
     discover_recent_taifex_csv_files,
+    plan_recent_taifex_csv_files,
     sync_recent_taifex_csv_files,
 )
 
@@ -301,3 +303,68 @@ def test_unmanaged_existing_file_is_not_overwritten_without_overwrite(
     assert summary.files_failed == 1
     assert "without a matching manifest" in summary.failures[0].error
     assert existing.read_bytes() == b"manual\n"
+
+
+def test_download_plan_classifies_valid_existing_and_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tifq.data.taifex_fetcher.time.sleep", lambda _: None)
+    one = row("2026/06/18", "/file/Daily_20260618.csv")
+    sync_recent_taifex_csv_files(
+        tmp_path,
+        limit=1,
+        client=sync_client(official_page(one)),
+    )
+    remote_files = discover_recent_taifex_csv_files(
+        limit=2,
+        client=mock_client(
+            official_page(
+                one,
+                row("2026/06/17", "/file/Daily_20260617.csv"),
+            )
+        ),
+    )
+
+    plan = build_taifex_download_plan(tmp_path, remote_files)
+
+    assert [item.status for item in plan.items] == ["valid_existing", "new"]
+    assert plan.valid_existing_count == 1
+    assert plan.missing_count == 1
+    assert plan.conflict_count == 0
+
+
+def test_download_plan_classifies_unmanaged_and_corrupt_existing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tifq.data.taifex_fetcher.time.sleep", lambda _: None)
+    html = official_page(
+        row("2026/06/18", "/file/Daily_20260618.csv"),
+        row("2026/06/17", "/file/Daily_20260617.csv"),
+    )
+    sync_recent_taifex_csv_files(tmp_path, limit=1, client=sync_client(html))
+    managed = tmp_path / "official" / "2026-06-18" / "Daily_20260618.csv"
+    managed.write_bytes(b"changed")
+    unmanaged = tmp_path / "official" / "2026-06-17" / "Daily_20260617.csv"
+    unmanaged.parent.mkdir(parents=True)
+    unmanaged.write_bytes(b"manual")
+    remote_files = discover_recent_taifex_csv_files(limit=2, client=mock_client(html))
+
+    plan = build_taifex_download_plan(tmp_path, remote_files)
+
+    assert [item.status for item in plan.items] == [
+        "corrupt_existing",
+        "unmanaged_conflict",
+    ]
+    assert plan.conflict_count == 2
+
+
+def test_plan_mode_does_not_create_raw_directory(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "not-created"
+    html = official_page(row("2026/06/18", "/file/Daily_20260618.csv"))
+
+    plan = plan_recent_taifex_csv_files(raw_dir, limit=1, client=mock_client(html))
+
+    assert plan.items[0].status == "new"
+    assert not raw_dir.exists()

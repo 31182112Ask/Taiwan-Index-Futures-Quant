@@ -9,12 +9,15 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup
+
+from tifq.runtime.locking import OperationLock
+from tifq.runtime.progress import ProgressCallback, ProgressReporter
 
 TAIFEX_RECENT_FUTURES_URL = "https://www.taifex.com.tw/cht/3/dlFutPrevious30DaysSalesData"
 TAIFEX_HOST = "www.taifex.com.tw"
@@ -80,6 +83,55 @@ class TaifexFetchSummary:
     files_failed: int
     records: tuple[TaifexDownloadRecord, ...]
     failures: tuple[TaifexDownloadFailure, ...]
+    plan: TaifexDownloadPlan | None = None
+
+
+DownloadStatus = Literal[
+    "new",
+    "valid_existing",
+    "remote_changed",
+    "unmanaged_conflict",
+    "duplicate_content",
+    "corrupt_existing",
+]
+
+
+@dataclass(frozen=True)
+class TaifexDownloadPlanItem:
+    """One remote/local comparison made before any download write."""
+
+    remote: TaifexRemoteFile
+    local_path: Path
+    status: DownloadStatus
+    size_bytes: int | None
+    sha256: str | None
+    recommended_action: str
+
+
+@dataclass(frozen=True)
+class TaifexDownloadPlan:
+    """Read-only official download plan."""
+
+    items: tuple[TaifexDownloadPlanItem, ...]
+
+    @property
+    def valid_existing_count(self) -> int:
+        return sum(item.status == "valid_existing" for item in self.items)
+
+    @property
+    def missing_count(self) -> int:
+        return sum(item.status in {"new", "remote_changed"} for item in self.items)
+
+    @property
+    def conflict_count(self) -> int:
+        return sum(
+            item.status in {"unmanaged_conflict", "corrupt_existing"}
+            for item in self.items
+        )
+
+    @property
+    def no_download_required(self) -> bool:
+        return bool(self.items) and self.valid_existing_count == len(self.items)
 
 
 def discover_recent_taifex_csv_files(
@@ -103,6 +155,72 @@ def discover_recent_taifex_csv_files(
     finally:
         if owns_client:
             active_client.close()
+
+
+def plan_recent_taifex_csv_files(
+    raw_dir: str | Path,
+    *,
+    limit: int = MAX_RECENT_FILES,
+    client: httpx.Client | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> TaifexDownloadPlan:
+    """Discover and compare local state without writing to disk."""
+    reporter = ProgressReporter("taifex_sync", progress_callback)
+    reporter.update("Discover", 0, None, "Discovering official TAIFEX files")
+    remote_files = discover_recent_taifex_csv_files(limit=limit, client=client)
+    reporter.update("Plan", 0, len(remote_files), "Comparing local manifest and files")
+    plan = build_taifex_download_plan(raw_dir, remote_files)
+    reporter.update("Plan", len(remote_files), len(remote_files), "Download plan ready")
+    return plan
+
+
+def build_taifex_download_plan(
+    raw_dir: str | Path,
+    remote_files: list[TaifexRemoteFile],
+) -> TaifexDownloadPlan:
+    """Classify each requested file without changing local state."""
+    raw_path = Path(raw_dir)
+    manifest = _load_manifest(raw_path) if raw_path.exists() else []
+    records_by_key = _manifest_records_by_key(manifest)
+    records_by_date = {str(record.get("trading_date")): record for record in manifest}
+    items: list[TaifexDownloadPlanItem] = []
+    for remote in remote_files:
+        local_path = _local_download_path(raw_path, remote)
+        record = records_by_key.get(_manifest_key(remote))
+        dated_record = records_by_date.get(remote.trading_date.isoformat())
+        status: DownloadStatus
+        action: str
+        size: int | None = local_path.stat().st_size if local_path.exists() else None
+        sha: str | None = None
+        if record is not None and _manifest_record_matches_file(record, local_path):
+            status = "valid_existing"
+            action = "use_existing"
+            sha = str(record.get("sha256"))
+        elif local_path.exists() and record is not None:
+            status = "corrupt_existing"
+            action = "review_and_quarantine"
+            expected = record.get("sha256")
+            sha = str(expected) if isinstance(expected, str) else None
+        elif local_path.exists():
+            status = "unmanaged_conflict"
+            action = "review_and_quarantine"
+        elif dated_record is not None and dated_record.get("download_url") != remote.download_url:
+            status = "remote_changed"
+            action = "download_missing"
+        else:
+            status = "new"
+            action = "download_missing"
+        items.append(
+            TaifexDownloadPlanItem(
+                remote=remote,
+                local_path=local_path,
+                status=status,
+                size_bytes=size,
+                sha256=sha,
+                recommended_action=action,
+            )
+        )
+    return TaifexDownloadPlan(tuple(items))
 
 
 def parse_recent_taifex_csv_files(html: str, source_url: str) -> list[TaifexRemoteFile]:
@@ -130,66 +248,80 @@ def sync_recent_taifex_csv_files(
     overwrite: bool = False,
     timeout_seconds: float = 60.0,
     client: httpx.Client | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> TaifexFetchSummary:
     """Download recent official TAIFEX CSV files into the V1 raw data directory."""
     _validate_limit(limit)
     raw_path = Path(raw_dir)
     raw_path.mkdir(parents=True, exist_ok=True)
-    manifest = _load_manifest(raw_path)
-    records_by_key = _manifest_records_by_key(manifest)
-
-    owns_client = client is None
-    active_client = client or _make_client(timeout_seconds)
-    try:
-        discovered_files = discover_recent_taifex_csv_files(
-            limit=MAX_RECENT_FILES,
-            client=active_client,
-        )
-        remote_files = discovered_files[:limit]
-        records: list[TaifexDownloadRecord] = []
-        failures: list[TaifexDownloadFailure] = []
-        for index, remote_file in enumerate(remote_files):
-            try:
-                record = _sync_one_file(
-                    raw_path,
-                    remote_file,
-                    client=active_client,
-                    manifest_record=records_by_key.get(_manifest_key(remote_file)),
-                    overwrite=overwrite,
-                )
-            except (OSError, TaifexFetchError) as exc:
-                failures.append(
-                    TaifexDownloadFailure(
-                        trading_date=remote_file.trading_date,
-                        download_url=remote_file.download_url,
-                        remote_filename=remote_file.remote_filename,
-                        local_path=_local_download_path(raw_path, remote_file),
-                        error=str(exc),
+    lock_dir = raw_path.parent.parent / ".runtime"
+    with OperationLock(lock_dir, "taifex_sync"):
+        manifest = _load_manifest(raw_path)
+        records_by_key = _manifest_records_by_key(manifest)
+        owns_client = client is None
+        active_client = client or _make_client(timeout_seconds)
+        reporter = ProgressReporter("taifex_sync", progress_callback)
+        try:
+            reporter.update("Discover", 0, None, "Discovering official TAIFEX files")
+            discovered_files = discover_recent_taifex_csv_files(
+                limit=MAX_RECENT_FILES,
+                client=active_client,
+            )
+            remote_files = discovered_files[:limit]
+            plan = build_taifex_download_plan(raw_path, remote_files)
+            reporter.update("Plan", 0, len(remote_files), "Download plan ready")
+            records: list[TaifexDownloadRecord] = []
+            failures: list[TaifexDownloadFailure] = []
+            for index, remote_file in enumerate(remote_files):
+                try:
+                    record = _sync_one_file(
+                        raw_path,
+                        remote_file,
+                        client=active_client,
+                        manifest_record=records_by_key.get(_manifest_key(remote_file)),
+                        overwrite=overwrite,
                     )
+                except (OSError, TaifexFetchError) as exc:
+                    failures.append(
+                        TaifexDownloadFailure(
+                            trading_date=remote_file.trading_date,
+                            download_url=remote_file.download_url,
+                            remote_filename=remote_file.remote_filename,
+                            local_path=_local_download_path(raw_path, remote_file),
+                            error=str(exc),
+                        )
+                    )
+                    continue
+
+                records.append(record)
+                reporter.update(
+                    "Download",
+                    index + 1,
+                    len(remote_files),
+                    f"{record.status}: {remote_file.remote_filename}",
                 )
-                continue
+                if record.status in {"downloaded", "updated"}:
+                    _upsert_manifest_record(manifest, remote_file, record)
+                    _write_manifest(raw_path, manifest)
+                    if index < len(remote_files) - 1:
+                        time.sleep(0.1)
+        finally:
+            if owns_client:
+                active_client.close()
 
-            records.append(record)
-            if record.status in {"downloaded", "updated"}:
-                _upsert_manifest_record(manifest, remote_file, record)
-                _write_manifest(raw_path, manifest)
-                if index < len(remote_files) - 1:
-                    time.sleep(0.1)
-    finally:
-        if owns_client:
-            active_client.close()
-
-    _write_manifest(raw_path, manifest)
-    return TaifexFetchSummary(
-        files_discovered=len(discovered_files),
-        files_selected=len(remote_files),
-        files_downloaded=sum(1 for record in records if record.status == "downloaded"),
-        files_skipped=sum(1 for record in records if record.status == "skipped"),
-        files_updated=sum(1 for record in records if record.status == "updated"),
-        files_failed=len(failures),
-        records=tuple(records),
-        failures=tuple(failures),
-    )
+        _write_manifest(raw_path, manifest)
+        reporter.update("Complete", len(remote_files), len(remote_files), "TAIFEX sync complete")
+        return TaifexFetchSummary(
+            files_discovered=len(discovered_files),
+            files_selected=len(remote_files),
+            files_downloaded=sum(1 for record in records if record.status == "downloaded"),
+            files_skipped=sum(1 for record in records if record.status == "skipped"),
+            files_updated=sum(1 for record in records if record.status == "updated"),
+            files_failed=len(failures),
+            records=tuple(records),
+            failures=tuple(failures),
+            plan=plan,
+        )
 
 
 def _remote_files_from_container(container: Any, source_url: str) -> list[TaifexRemoteFile]:

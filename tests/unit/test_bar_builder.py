@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -120,6 +121,24 @@ def test_build_bar_files_empty_tick_directory_returns_empty_summary(tmp_path: Pa
     assert summary.output_paths == ()
 
 
+def test_zero_output_tick_file_is_unchanged_on_second_build(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "processed"
+    ticks = tick_frame().loc[[0]].reset_index(drop=True)
+    ticks["timestamp"] = pd.to_datetime(["2026-06-17 14:00:00"]).tz_localize(
+        "Asia/Taipei"
+    )
+    write_parquet(ticks, tick_path(processed_dir, "TMF", date(2026, 6, 17)))
+
+    first = build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+    second = build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+
+    assert first.tick_files_read == 1
+    assert first.output_bar_count == 0
+    assert second.tick_files_read == 0
+    assert second.tick_files_skipped == 1
+    assert second.no_op is True
+
+
 def test_discover_tick_files_returns_sorted_parquet_files(tmp_path: Path) -> None:
     tick_dir = tmp_path / "processed" / "ticks" / "TMF"
     tick_dir.mkdir(parents=True)
@@ -132,3 +151,63 @@ def test_discover_tick_files_returns_sorted_parquet_files(tmp_path: Path) -> Non
         tick_dir / "2026-06-18.parquet",
     ]
 
+
+def test_incremental_bar_build_second_run_does_not_read_or_rewrite_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processed_dir = tmp_path / "processed"
+    tick_output = tick_path(processed_dir, "TMF", date(2026, 6, 17))
+    write_parquet(tick_frame().loc[0:2].reset_index(drop=True), tick_output)
+    first = build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+    output = first.output_paths[0]
+    output_mtime = output.stat().st_mtime_ns
+
+    monkeypatch.setattr(
+        "tifq.bars.builder.read_parquet",
+        lambda path: (_ for _ in ()).throw(AssertionError(f"unexpected read: {path}")),
+    )
+    second = build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+
+    assert second.no_op is True
+    assert second.tick_files_read == 0
+    assert second.tick_files_skipped == 1
+    assert output.stat().st_mtime_ns == output_mtime
+
+
+def test_bar_manifest_tracks_timeframes_separately(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "processed"
+    write_parquet(
+        tick_frame().loc[0:2].reset_index(drop=True),
+        tick_path(processed_dir, "TMF", date(2026, 6, 17)),
+    )
+
+    build_bar_files(processed_dir, symbol="TMF", timeframe="1m")
+    build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+
+    payload = json.loads((processed_dir / "bar_manifest.json").read_text(encoding="utf-8"))
+    assert {record["timeframe"] for record in payload["records"]} == {"1m", "5m"}
+
+
+def test_bar_build_failure_does_not_modify_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processed_dir = tmp_path / "processed"
+    tick_output = tick_path(processed_dir, "TMF", date(2026, 6, 17))
+    write_parquet(tick_frame().loc[0:2].reset_index(drop=True), tick_output)
+    build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+    manifest = processed_dir / "bar_manifest.json"
+    before = manifest.read_bytes()
+    changed = tick_frame().loc[0:2].reset_index(drop=True)
+    changed.loc[0, "price"] = 999.0
+    write_parquet(changed, tick_output)
+    monkeypatch.setattr(
+        "tifq.bars.builder.resample_ticks_to_bars",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("build failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        build_bar_files(processed_dir, symbol="TMF", timeframe="5m")
+
+    assert manifest.read_bytes() == before

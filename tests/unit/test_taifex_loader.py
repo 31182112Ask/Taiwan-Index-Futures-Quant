@@ -7,6 +7,7 @@ import pytest
 
 from tifq.data.storage import read_parquet
 from tifq.data.taifex_loader import (
+    PARSER_VERSION,
     TaifexImportError,
     discover_taifex_files,
     import_taifex_ticks,
@@ -16,6 +17,33 @@ from tifq.data.taifex_loader import (
 def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
+def test_import_official_taifex_b_plus_s_volume_column(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+
+    csv_content = "\n".join(
+        [
+            (
+                "成交日期,商品代號,到期月份(週別),成交時間,"
+                "成交價格,成交數量(B+S),近月價格,遠月價格,開盤集合競價"
+            ),
+            "2026/05/11,TMF,202605,08:45:00,22000,2,,,",
+        ]
+    )
+
+    with ZipFile(raw_dir / "Daily_2026_05_11.zip", "w") as archive:
+        archive.writestr("Daily_2026_05_11.csv", csv_content)
+
+    summary = import_taifex_ticks(raw_dir, processed_dir)
+
+    assert summary.files_discovered == 1
+    assert summary.csv_files_read == 1
+    assert summary.output_tick_count == 1
+
+    ticks = read_parquet(summary.output_paths[0])
+    assert ticks.loc[0, "symbol"] == "TMF"
+    assert ticks.loc[0, "volume"] == 2
 
 def test_import_taifex_ticks_from_csv_writes_daily_parquet(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
@@ -155,3 +183,91 @@ def test_import_taifex_ticks_empty_raw_directory_returns_empty_summary(tmp_path:
     assert summary.csv_files_read == 0
     assert summary.output_tick_count == 0
     assert summary.output_paths == ()
+
+
+def test_incremental_import_second_run_is_true_no_op(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    write_text(
+        raw_dir / "ticks.csv",
+        "symbol,contract,timestamp,price,volume\n"
+        "TMF,202606,2026-06-17 08:45:00,22000,1\n",
+    )
+    first = import_taifex_ticks(raw_dir, processed_dir)
+    output = first.output_paths[0]
+    output_mtime = output.stat().st_mtime_ns
+
+    monkeypatch.setattr(
+        "tifq.data.taifex_loader._read_raw_file",
+        lambda path: (_ for _ in ()).throw(AssertionError(f"unexpected read: {path}")),
+    )
+    second = import_taifex_ticks(raw_dir, processed_dir)
+
+    assert second.no_op is True
+    assert second.files_skipped == 1
+    assert second.csv_files_read == 0
+    assert output.stat().st_mtime_ns == output_mtime
+    assert (processed_dir / "import_manifest.json").exists()
+
+
+def test_incremental_import_reads_only_new_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    first_file = raw_dir / "first.csv"
+    write_text(
+        first_file,
+        "symbol,contract,timestamp,price,volume\n"
+        "TMF,202606,2026-06-17 08:45:00,22000,1\n",
+    )
+    import_taifex_ticks(raw_dir, processed_dir)
+    second_file = raw_dir / "second.csv"
+    write_text(
+        second_file,
+        "symbol,contract,timestamp,price,volume\n"
+        "TMF,202606,2026-06-18 08:45:00,22100,1\n",
+    )
+    from tifq.data import taifex_loader
+
+    original = taifex_loader._read_raw_file
+    reads: list[Path] = []
+
+    def recording_read(path: Path):
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(taifex_loader, "_read_raw_file", recording_read)
+
+    summary = import_taifex_ticks(raw_dir, processed_dir)
+
+    assert reads == [second_file.resolve()]
+    assert summary.files_skipped == 1
+    assert summary.files_changed == 1
+
+
+def test_parser_version_change_rebuilds_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+    raw_dir.mkdir()
+    write_text(
+        raw_dir / "ticks.csv",
+        "symbol,contract,timestamp,price,volume\n"
+        "TMF,202606,2026-06-17 08:45:00,22000,1\n",
+    )
+    import_taifex_ticks(raw_dir, processed_dir)
+    monkeypatch.setattr("tifq.data.taifex_loader.PARSER_VERSION", PARSER_VERSION + "-new")
+
+    summary = import_taifex_ticks(raw_dir, processed_dir)
+
+    assert summary.files_changed == 1
+    assert summary.no_op is False

@@ -43,10 +43,19 @@ data/results/**
 
 data/smoke/
 data/test-runtime/
-artifacts/ui/
+data/quarantine/
+data/.runtime/
+data/cache/
+artifacts/
 *.parquet
 download_manifest.json
+import_manifest.json
+bar_manifest.json
 *.part
+*.tmp
+*.temp
+*.lock
+*.staging/
 
 logs/**
 !logs/

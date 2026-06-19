@@ -57,11 +57,23 @@ def test_sync_taifex_cli_orchestrates_download_import_and_bar_build(
         calls.append(f"sync:{raw_dir}:{kwargs['limit']}:{kwargs['overwrite']}")
         return fetch_summary(tmp_path)
 
-    def fake_import(raw_dir: Path, processed_dir: Path, *, symbol: str) -> DummyImportSummary:
+    def fake_import(
+        raw_dir: Path,
+        processed_dir: Path,
+        *,
+        symbol: str,
+        **kwargs: object,
+    ) -> DummyImportSummary:
         calls.append(f"import:{raw_dir}:{processed_dir}:{symbol}")
         return DummyImportSummary()
 
-    def fake_build(processed_dir: Path, *, symbol: str, timeframe: str) -> DummyBarSummary:
+    def fake_build(
+        processed_dir: Path,
+        *,
+        symbol: str,
+        timeframe: str,
+        **kwargs: object,
+    ) -> DummyBarSummary:
         calls.append(f"build:{processed_dir}:{symbol}:{timeframe}")
         return DummyBarSummary()
 

@@ -19,7 +19,8 @@ from tifq.backtest import (
     persist_backtest_result,
     run_backtest_from_config,
 )
-from tifq.backtest.engine import load_configured_bars
+from tifq.backtest.contracts import select_contract_bars
+from tifq.backtest.engine import discover_bar_files, load_configured_bars
 from tifq.backtest.metrics import MetricValue
 from tifq.bars import build_bar_files, discover_tick_files
 from tifq.config import ConfigLoadError, load_backtest_config
@@ -27,11 +28,22 @@ from tifq.config.models import BacktestConfig
 from tifq.data import import_taifex_ticks
 from tifq.data.storage import read_parquet
 from tifq.data.taifex_fetcher import (
+    TaifexDownloadPlan,
     TaifexFetchError,
     TaifexFetchSummary,
+    plan_recent_taifex_csv_files,
     sync_recent_taifex_csv_files,
 )
 from tifq.indicators import append_basic_indicators
+from tifq.runtime import (
+    CleanupSummary,
+    HealthReport,
+    apply_confirmed_cleanup,
+    apply_safe_cleanup,
+    run_environment_health_check,
+)
+from tifq.runtime.cleanup import CleanupAction
+from tifq.runtime.progress import ProgressUpdate
 
 _UNSAFE_ELEMENT_KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -65,6 +77,12 @@ class LoadedResultRun:
     metrics: dict[str, MetricValue]
     trades: pd.DataFrame
     equity_curve: pd.DataFrame
+    model_bars: pd.DataFrame
+    signals: pd.DataFrame
+    contract_selection: pd.DataFrame
+    diagnostics: dict[str, Any]
+    timings: dict[str, float]
+    legacy: bool
 
 
 def main() -> None:
@@ -83,6 +101,12 @@ def main() -> None:
     )
     _inject_style(st)
     st.title("Taiwan Index Futures Quant")
+    startup_check = st.cache_resource(show_spinner=False)(_startup_environment_check)
+    startup_report, startup_cleanup = startup_check(str(Path.cwd()))
+    if "health_report" not in st.session_state:
+        st.session_state["health_report"] = startup_report
+        st.session_state["startup_cleanup"] = startup_cleanup
+    _render_environment_status(st)
 
     config_path = st.sidebar.text_input("Config", "configs/v1_backtest.yaml")
     try:
@@ -174,12 +198,140 @@ def load_result_run(
     metrics = json.loads((path / "metrics.json").read_text(encoding="utf-8"))
     trades = pd.read_csv(path / "trades.csv")
     equity_curve = pd.read_csv(path / "equity_curve.csv")
+    model_bars_path = path / "model_bars.parquet"
+    signals_path = path / "signals.csv"
+    contract_selection_path = path / "contract_selection.csv"
+    diagnostics_path = path / "diagnostics.json"
+    timings_path = path / "timings.json"
+    required_new = (
+        model_bars_path,
+        signals_path,
+        contract_selection_path,
+        diagnostics_path,
+        timings_path,
+        path / "data_fingerprint.json",
+    )
     return LoadedResultRun(
         config=config_payload,
         metrics=metrics,
         trades=trades,
         equity_curve=equity_curve,
+        model_bars=read_parquet(model_bars_path) if model_bars_path.exists() else pd.DataFrame(),
+        signals=_read_optional_csv(signals_path),
+        contract_selection=_read_optional_csv(contract_selection_path),
+        diagnostics=_read_optional_json(diagnostics_path),
+        timings={
+            key: float(value)
+            for key, value in _read_optional_json(timings_path).items()
+            if isinstance(value, int | float)
+        },
+        legacy=not all(artifact.exists() for artifact in required_new),
     )
+
+
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _read_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _startup_environment_check(repository_root: str) -> tuple[HealthReport, CleanupSummary]:
+    report = run_environment_health_check(repository_root)
+    cleanup = apply_safe_cleanup(report.cleanup_plan, repository_root)
+    if cleanup.applied:
+        report = run_environment_health_check(repository_root)
+    return report, cleanup
+
+
+def _render_environment_status(st: Any) -> None:
+    report = st.session_state.get("health_report")
+    if not isinstance(report, HealthReport):
+        return
+    st.subheader("Environment Status")
+    status_columns = st.columns(5)
+    status_columns[0].metric("Status", report.status.title())
+    status_columns[1].metric("Last checked", report.checked_at[11:19] + " UTC")
+    startup_cleanup = st.session_state.get("startup_cleanup")
+    cleaned = len(startup_cleanup.applied) if isinstance(startup_cleanup, CleanupSummary) else 0
+    status_columns[2].metric("Temporary files cleaned", cleaned)
+    status_columns[3].metric(
+        "Duplicate candidates", report.cleanup_plan.confirmation_action_count
+    )
+    status_columns[4].metric(
+        "Conflicts", sum(issue.severity == "error" for issue in report.issues)
+    )
+    controls = st.columns(3)
+    if controls[0].button("Recheck", key="environment_recheck"):
+        st.session_state["health_report"] = run_environment_health_check(Path.cwd())
+        st.rerun()
+    if controls[1].button("Full scan", key="environment_full_scan"):
+        st.session_state["health_report"] = run_environment_health_check(
+            Path.cwd(), full_scan=True
+        )
+        st.rerun()
+    review = controls[2].toggle(
+        "Review cleanup plan",
+        value=False,
+        key="environment_review_cleanup",
+    )
+    if review:
+        plan = report.cleanup_plan
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "action": action.action,
+                        "path": str(action.path),
+                        "reason": action.reason,
+                        "bytes": action.size_bytes,
+                        "automatic": action.safe_to_apply_automatically,
+                    }
+                    for action in plan.actions
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            key="environment_cleanup_plan",
+        )
+        action_columns = st.columns(2)
+        if action_columns[0].button(
+            "Apply safe cleanup",
+            disabled=plan.safe_action_count == 0,
+            key="environment_apply_safe",
+        ):
+            summary = apply_safe_cleanup(plan, Path.cwd())
+            st.session_state["startup_cleanup"] = summary
+            st.session_state["health_report"] = run_environment_health_check(Path.cwd())
+            st.rerun()
+        confirm = action_columns[1].checkbox(
+            "Confirm duplicate quarantine",
+            key="environment_confirm_quarantine",
+        )
+        duplicate_actions = tuple(
+            action
+            for action in plan.actions
+            if action.action == "quarantine" and "duplicate raw content" in action.reason
+        )
+        if st.button(
+            "Quarantine confirmed duplicates",
+            disabled=not confirm or not duplicate_actions,
+            key="environment_quarantine_duplicates",
+        ):
+            apply_confirmed_cleanup(duplicate_actions, Path.cwd())
+            st.session_state["health_report"] = run_environment_health_check(
+                Path.cwd(), full_scan=True
+            )
+            st.rerun()
 
 
 def build_run_comparison_table(runs: list[tuple[ResultRun, LoadedResultRun]]) -> pd.DataFrame:
@@ -232,6 +384,10 @@ def build_config_override(
     initial_cash: float,
     max_position: int,
     allow_short: bool,
+    contract_mode: str | None = None,
+    contract: str | None = None,
+    roll_confirmation_days: int | None = None,
+    assumed_margin_per_contract: float | None = None,
 ) -> BacktestConfig:
     """Build a validated config from UI control values."""
     payload = base_config.model_dump(mode="python")
@@ -242,6 +398,11 @@ def build_config_override(
         "start_date": start_date,
         "end_date": end_date,
         "timeframe": timeframe,
+        "contract_mode": contract_mode or base_config.data.contract_mode,
+        "contract": contract,
+        "roll_confirmation_days": roll_confirmation_days
+        if roll_confirmation_days is not None
+        else base_config.data.roll_confirmation_days,
     }
     payload["strategy"] = {
         **payload["strategy"],
@@ -271,6 +432,7 @@ def build_config_override(
         "initial_cash": initial_cash,
         "max_position": max_position,
         "allow_short": allow_short,
+        "assumed_margin_per_contract": assumed_margin_per_contract,
     }
     return BacktestConfig.model_validate(payload)
 
@@ -291,6 +453,20 @@ def _render_sidebar_config(st: Any, base_config: BacktestConfig) -> BacktestConf
         options=["5m", "1m"],
         index=["5m", "1m"].index(data.timeframe),
         horizontal=True,
+    )
+    contract_mode = st.sidebar.selectbox(
+        "Contract mode",
+        options=["continuous_front_month", "single_contract"],
+        index=["continuous_front_month", "single_contract"].index(data.contract_mode),
+    )
+    contract = None
+    if contract_mode == "single_contract":
+        contract = st.sidebar.text_input("Contract (YYYYMM)", data.contract or "") or None
+    roll_confirmation_days = st.sidebar.number_input(
+        "Roll confirmation days",
+        min_value=1,
+        value=int(data.roll_confirmation_days),
+        disabled=contract_mode == "single_contract",
     )
 
     st.sidebar.header("Strategy")
@@ -375,7 +551,7 @@ def _render_sidebar_config(st: Any, base_config: BacktestConfig) -> BacktestConf
 
     st.sidebar.header("Portfolio")
     initial_cash = st.sidebar.number_input(
-        "Initial cash",
+        "Initial accounting cash",
         min_value=1.0,
         value=float(portfolio.initial_cash),
         step=10_000.0,
@@ -387,6 +563,20 @@ def _render_sidebar_config(st: Any, base_config: BacktestConfig) -> BacktestConf
         value=int(portfolio.max_position),
     )
     allow_short = st.sidebar.checkbox("Allow short", value=portfolio.allow_short)
+    use_assumed_margin = st.sidebar.checkbox(
+        "Use assumed margin",
+        value=portfolio.assumed_margin_per_contract is not None,
+    )
+    assumed_margin = st.sidebar.number_input(
+        "Assumed margin per contract",
+        min_value=1.0,
+        value=float(portfolio.assumed_margin_per_contract or 50_000.0),
+        disabled=not use_assumed_margin,
+        help="User assumption only; this is not a live official TAIFEX margin value.",
+    )
+    st.sidebar.caption(
+        "Initial cash sets starting equity only. V1 sizes fixed contracts through max position."
+    )
 
     return build_config_override(
         base_config,
@@ -412,6 +602,10 @@ def _render_sidebar_config(st: Any, base_config: BacktestConfig) -> BacktestConf
         initial_cash=float(initial_cash),
         max_position=int(max_position),
         allow_short=bool(allow_short),
+        contract_mode=str(contract_mode),
+        contract=contract,
+        roll_confirmation_days=int(roll_confirmation_days),
+        assumed_margin_per_contract=float(assumed_margin) if use_assumed_margin else None,
     )
 
 
@@ -437,8 +631,13 @@ def _render_data_import(st: Any, config: BacktestConfig) -> None:
         st.info("No local TAIFEX CSV or ZIP files found in the selected raw directory.")
 
     if st.button("Import TAIFEX", type="primary"):
+        progress = _StreamlitProgress(st, "Importing TAIFEX files")
         try:
-            summary = import_taifex_ticks(config.data.raw_dir, config.data.processed_dir)
+            summary = import_taifex_ticks(
+                config.data.raw_dir,
+                config.data.processed_dir,
+                progress_callback=progress,
+            )
         except (OSError, ValueError) as exc:
             st.error(f"Import failed: {exc}")
         else:
@@ -451,6 +650,9 @@ def _render_data_import(st: Any, config: BacktestConfig) -> None:
                     "clean_ticks": summary.output_tick_count,
                     "invalid_or_filtered_rows": summary.invalid_row_count,
                     "output_paths": [str(path) for path in summary.output_paths],
+                    "unchanged_files": summary.files_skipped,
+                    "changed_files": summary.files_changed,
+                    "no_op": summary.no_op,
                 }
             )
 
@@ -470,46 +672,165 @@ def _render_official_sync(st: Any, config: BacktestConfig) -> None:
     button_cols = st.columns(2)
     download_only = button_cols[0].button("Sync downloads only")
     full_sync = button_cols[1].button("Sync, import, and build bars", type="primary")
-    if not (download_only or full_sync):
+    if download_only or full_sync:
+        progress = _StreamlitProgress(st, "Planning official TAIFEX sync")
+        try:
+            plan = plan_recent_taifex_csv_files(
+                config.data.raw_dir,
+                limit=int(limit),
+                progress_callback=progress,
+            )
+        except (OSError, ValueError, TaifexFetchError) as exc:
+            st.error(f"TAIFEX plan failed: {exc}")
+            return
+        st.session_state["taifex_download_plan"] = plan
+        st.session_state["taifex_full_sync"] = bool(full_sync)
+
+    plan = st.session_state.get("taifex_download_plan")
+    if not isinstance(plan, TaifexDownloadPlan):
+        return
+    st.write("Download Plan")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "trading_date": item.remote.trading_date,
+                    "remote_filename": item.remote.remote_filename,
+                    "local_path": str(item.local_path),
+                    "status": item.status,
+                    "size_bytes": item.size_bytes,
+                    "sha256": item.sha256,
+                    "recommended_action": item.recommended_action,
+                }
+                for item in plan.items
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+        key="taifex_download_plan_table",
+    )
+    st.caption(
+        f"{plan.valid_existing_count} valid existing, {plan.missing_count} missing/changed, "
+        f"{plan.conflict_count} conflicts."
+    )
+    if plan.conflict_count:
+        st.error("Conflicting or corrupt local files require review before download can continue.")
+        confirm_quarantine = st.checkbox(
+            "Confirm moving listed conflicts to data/quarantine",
+            key="taifex_confirm_conflict_quarantine",
+        )
+        conflict_columns = st.columns(2)
+        if conflict_columns[0].button("Cancel", key="taifex_conflict_cancel"):
+            _clear_download_plan(st)
+            st.rerun()
+        if conflict_columns[1].button(
+            "Quarantine conflicts",
+            disabled=not confirm_quarantine,
+            key="taifex_quarantine_conflicts",
+        ):
+            actions = tuple(
+                CleanupAction(
+                    "quarantine",
+                    item.local_path,
+                    f"TAIFEX {item.status}",
+                    item.size_bytes or 0,
+                    False,
+                )
+                for item in plan.items
+                if item.status in {"unmanaged_conflict", "corrupt_existing"}
+            )
+            summary = apply_confirmed_cleanup(actions, Path.cwd())
+            if summary.failed:
+                st.error("; ".join(summary.failed))
+            else:
+                st.success(f"Quarantined {len(summary.applied)} conflict files.")
+                _clear_download_plan(st)
         return
 
-    status = st.status("Syncing official TAIFEX files...", expanded=True)
+    if plan.no_download_required:
+        st.info(
+            f"Requested TAIFEX data already exists: {len(plan.items)} of {len(plan.items)} "
+            "selected trading days are valid."
+        )
+        primary_label = "Use existing files"
+    else:
+        st.info(
+            f"{plan.valid_existing_count} valid existing and "
+            f"{plan.missing_count} files to download."
+        )
+        primary_label = "Download missing files only"
+    decision_columns = st.columns(2)
+    if decision_columns[0].button("Cancel", key="taifex_plan_cancel"):
+        _clear_download_plan(st)
+        st.rerun()
+    proceed = decision_columns[1].button(primary_label, type="primary", key="taifex_plan_proceed")
+    force_confirmed = st.checkbox(
+        "I confirm overwriting every selected managed file",
+        value=False,
+        key="taifex_force_confirm",
+    )
+    force = st.button(
+        "Force redownload all",
+        disabled=not (force_confirmed and overwrite),
+        key="taifex_force_redownload",
+    )
+    if not (proceed or force):
+        return
+    _execute_official_sync(
+        st,
+        config,
+        limit=int(limit),
+        overwrite=bool(force),
+        full_sync=bool(st.session_state.get("taifex_full_sync", False)),
+    )
+    _clear_download_plan(st)
+
+
+def _execute_official_sync(
+    st: Any,
+    config: BacktestConfig,
+    *,
+    limit: int,
+    overwrite: bool,
+    full_sync: bool,
+) -> None:
+    progress = _StreamlitProgress(st, "Syncing official TAIFEX files")
     try:
         fetch_summary = sync_recent_taifex_csv_files(
             config.data.raw_dir,
-            limit=int(limit),
-            overwrite=bool(overwrite),
+            limit=limit,
+            overwrite=overwrite,
+            progress_callback=progress,
         )
+        if fetch_summary.files_failed:
+            st.error("Official TAIFEX sync completed with failures.")
+            st.json(_sync_display_payload(fetch_summary, None, None))
+            return
         import_summary = None
         bar_summary = None
         if full_sync:
-            if fetch_summary.files_failed:
-                status.update(
-                    label="Official TAIFEX sync completed with failures.",
-                    state="error",
-                )
-                st.json(_sync_display_payload(fetch_summary, None, None))
-                return
             import_summary = import_taifex_ticks(
                 config.data.raw_dir,
                 config.data.processed_dir,
                 symbol=config.data.symbol,
+                progress_callback=progress,
             )
             bar_summary = build_bar_files(
                 config.data.processed_dir,
                 symbol=config.data.symbol,
                 timeframe=config.data.timeframe,
+                progress_callback=progress,
             )
     except (OSError, ValueError, TaifexFetchError) as exc:
-        status.update(label=f"TAIFEX sync failed: {exc}", state="error")
+        st.error(f"TAIFEX sync failed: {exc}")
         return
-
-    state = "error" if fetch_summary.files_failed else "complete"
-    label = "Official TAIFEX sync completed with failures." if fetch_summary.files_failed else (
-        "Official TAIFEX sync completed."
-    )
-    status.update(label=label, state=state)
+    st.success("Official TAIFEX sync completed.")
     st.json(_sync_display_payload(fetch_summary, import_summary, bar_summary))
+
+
+def _clear_download_plan(st: Any) -> None:
+    st.session_state.pop("taifex_download_plan", None)
+    st.session_state.pop("taifex_full_sync", None)
 
 
 def _sync_display_payload(
@@ -557,13 +878,39 @@ def _render_bar_builder(st: Any, config: BacktestConfig) -> None:
     cols[1].metric("Bars", f"{summary.row_count:,}")
     cols[2].metric("Range", _date_range_label(summary))
     cols[3].metric("Contracts", summary.contracts)
+    manifest_path = config.data.processed_dir / "bar_manifest.json"
+    st.caption(
+        f"Incremental manifest: {'available' if manifest_path.exists() else 'not created yet'} "
+        f"({manifest_path})"
+    )
+    tick_files = discover_tick_files(config.data.processed_dir, config.data.symbol)
+    st.caption(f"Incremental candidates: {len(tick_files)} daily tick files.")
+    force_rebuild = st.checkbox(
+        "Force rebuild selected dates",
+        value=False,
+        key="bar_builder_force_rebuild",
+        help="Default builds only changed tick files. Force rebuild rewrites all selected dates.",
+    )
+    confirm_force = st.checkbox(
+        "Confirm forced bar rebuild",
+        value=False,
+        disabled=not force_rebuild,
+        key="bar_builder_confirm_force",
+    )
 
-    if st.button("Build bars", type="primary"):
+    if st.button(
+        "Build bars",
+        type="primary",
+        disabled=force_rebuild and not confirm_force,
+    ):
+        progress = _StreamlitProgress(st, "Building OHLCV bars")
         try:
             build_summary = build_bar_files(
                 config.data.processed_dir,
                 symbol=config.data.symbol,
                 timeframe=config.data.timeframe,
+                force=force_rebuild,
+                progress_callback=progress,
             )
         except (OSError, ValueError) as exc:
             st.error(f"Bar build failed: {exc}")
@@ -575,6 +922,9 @@ def _render_bar_builder(st: Any, config: BacktestConfig) -> None:
                     "input_ticks": build_summary.input_tick_count,
                     "output_bars": build_summary.output_bar_count,
                     "output_paths": [str(path) for path in build_summary.output_paths],
+                    "unchanged_tick_files": build_summary.tick_files_skipped,
+                    "rebuilt_tick_files": build_summary.tick_files_rebuilt,
+                    "no_op": build_summary.no_op,
                 }
             )
 
@@ -599,14 +949,55 @@ def _render_strategy_config(st: Any, config: BacktestConfig) -> None:
             "portfolio": config.portfolio.model_dump(mode="json"),
         }
     )
+    st.write("Contract and Position Model")
+    st.json(
+        {
+            "contract_mode": config.data.contract_mode,
+            "single_contract": config.data.contract,
+            "roll_confirmation_days": config.data.roll_confirmation_days,
+            "continuous_series": "unadjusted",
+            "position_sizing_mode": "fixed contracts",
+            "maximum_position": f"{config.portfolio.max_position} contract",
+            "initial_cash_role": "starting accounting equity only",
+            "margin_validation": (
+                f"user assumption: {config.portfolio.assumed_margin_per_contract:,.0f}"
+                if config.portfolio.assumed_margin_per_contract is not None
+                else "not configured"
+            ),
+        }
+    )
 
 
 def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
     st.subheader("Run Backtest")
-    if st.button("Run backtest", type="primary"):
+    fingerprint = _configured_bar_fingerprint(config)
+    cached_preflight = st.cache_data(show_spinner=False)(_backtest_preflight)
+    try:
+        preflight = cached_preflight(config.model_dump_json(), fingerprint)
+        preflight_error = None
+    except (OSError, ValueError) as exc:
+        preflight = {}
+        preflight_error = str(exc)
+    st.write("Data Health")
+    if preflight_error is not None:
+        st.error(preflight_error)
+    else:
+        preflight_columns = st.columns(6)
+        preflight_columns[0].metric("Estimated bars", preflight.get("bar_count", 0))
+        preflight_columns[1].metric("Trading days", preflight.get("trading_days", 0))
+        preflight_columns[2].metric("Selected contracts", preflight.get("contracts", 0))
+        preflight_columns[3].metric("Roll count", preflight.get("roll_count", 0))
+        preflight_columns[4].metric("Duplicate timestamps", preflight.get("duplicates", 0))
+        preflight_columns[5].metric("Indicator readiness", preflight.get("readiness", "-"))
+        st.caption(
+            f"Date range: {preflight.get('date_range', '-')}; mode: {config.data.contract_mode}; "
+            "continuous series is unadjusted."
+        )
+    if st.button("Run backtest", type="primary", disabled=preflight_error is not None):
+        progress = _StreamlitProgress(st, "Running backtest")
         try:
-            result = run_backtest_from_config(config)
-            paths = persist_backtest_result(config, result)
+            result = run_backtest_from_config(config, progress_callback=progress)
+            paths = persist_backtest_result(config, result, progress_callback=progress)
         except (OSError, ValueError) as exc:
             st.error(f"Backtest failed: {exc}")
         else:
@@ -617,13 +1008,12 @@ def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
     result = st.session_state.get("last_result")
     if isinstance(result, BacktestResult):
         _render_result_summary(st, result.metrics)
-        chart_bars = _load_chart_bars(config)
         _render_charts(
             st,
             go,
             result.equity_curve,
             result.trades,
-            chart_bars,
+            result.model_bars.tail(500),
             key_prefix="run_backtest",
         )
         st.dataframe(
@@ -633,8 +1023,56 @@ def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
             key="run_backtest_trades",
         )
         st.caption(f"Latest run directory: {st.session_state.get('last_run_dir', '-')}")
+        _render_backtest_diagnostics(st, result.diagnostics, result.metrics)
     else:
         st.info("Run a backtest to view equity, daily PnL, K-line overlays, and trades.")
+
+
+def _configured_bar_fingerprint(config: BacktestConfig) -> tuple[tuple[str, int, int], ...]:
+    files = discover_bar_files(
+        config.data.processed_dir,
+        symbol=config.data.symbol,
+        timeframe=config.data.timeframe,
+        start_date=config.data.start_date,
+        end_date=config.data.end_date,
+    )
+    return tuple(
+        (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns) for path in files
+    )
+
+
+def _backtest_preflight(
+    config_json: str,
+    fingerprint: tuple[tuple[str, int, int], ...],
+) -> dict[str, Any]:
+    del fingerprint
+    config = BacktestConfig.model_validate_json(config_json)
+    raw_bars = load_configured_bars(config)
+    selection = select_contract_bars(
+        raw_bars,
+        contract_mode=config.data.contract_mode,
+        contract=config.data.contract,
+        roll_confirmation_days=config.data.roll_confirmation_days,
+    )
+    params = config.strategy.params
+    enriched = append_basic_indicators(
+        selection.bars,
+        ema_fast=_int_param(dict(params), "ema_fast", 20),
+        ema_slow=_int_param(dict(params), "ema_slow", 60),
+        atr_period=_int_param(dict(params), "atr_period", 14),
+        volatility_window=_int_param(dict(params), "volatility_window", 20),
+    )
+    timestamps = pd.to_datetime(selection.bars["timestamp"])
+    readiness = enriched[["ema_fast", "ema_slow", "atr"]].notna().all(axis=1).mean()
+    return {
+        "bar_count": len(selection.bars),
+        "trading_days": int(timestamps.dt.date.nunique()),
+        "contracts": int(selection.bars["contract"].nunique()),
+        "roll_count": int(selection.audit["rolled"].sum()),
+        "duplicates": int(timestamps.duplicated().sum()),
+        "readiness": f"{readiness:.1%}",
+        "date_range": f"{timestamps.min().date()} to {timestamps.max().date()}",
+    }
 
 
 def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
@@ -647,15 +1085,21 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
     labels = [f"{run.strategy} / {run.run_id}" for run in runs]
     selected_label = st.selectbox("Run", labels)
     selected = runs[labels.index(selected_label)]
-    loaded = load_result_run(selected.run_dir)
+    cached_load = st.cache_data(show_spinner=False)(_load_result_run_cached)
+    loaded = cached_load(str(selected.run_dir), _run_dir_fingerprint(selected.run_dir))
     result_key = _element_key(f"result_browser_{selected.run_id}")
     _render_result_summary(st, loaded.metrics)
+    if loaded.legacy:
+        st.warning(
+            "Legacy run: reproducibility artifacts are incomplete. Existing metrics and trades "
+            "remain available; missing diagnostics are not reconstructed."
+        )
     _render_charts(
         st,
         go,
         loaded.equity_curve,
         loaded.trades,
-        pd.DataFrame(),
+        loaded.model_bars.tail(500),
         key_prefix=result_key,
     )
     st.dataframe(
@@ -665,6 +1109,15 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
         key=f"{result_key}_trades",
     )
     st.caption(str(selected.run_dir))
+    if not loaded.contract_selection.empty:
+        with st.expander("Contract Selection Audit"):
+            st.dataframe(loaded.contract_selection, width="stretch", hide_index=True)
+    if loaded.diagnostics:
+        with st.expander("Diagnostics", expanded=loaded.metrics.get("trade_count", 0) == 0):
+            st.json(loaded.diagnostics)
+    if loaded.timings:
+        with st.expander("Timing Summary"):
+            st.json(loaded.timings)
 
     st.write("Run Comparison")
     default_labels = labels[: min(2, len(labels))]
@@ -678,7 +1131,13 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
         st.info("Select 2 to 5 runs for comparison.")
         return
     selected_runs = [runs[labels.index(label)] for label in selected_labels[:5]]
-    loaded_runs = [(run, load_result_run(run.run_dir)) for run in selected_runs]
+    loaded_runs = [
+        (
+            run,
+            cached_load(str(run.run_dir), _run_dir_fingerprint(run.run_dir)),
+        )
+        for run in selected_runs
+    ]
     st.dataframe(
         build_run_comparison_table(loaded_runs),
         width="stretch",
@@ -702,6 +1161,80 @@ def _render_result_summary(st: Any, metrics: dict[str, MetricValue]) -> None:
     detail_cols[2].metric("Fee", _money(metrics.get("total_fee", 0)))
     detail_cols[3].metric("Tax", _money(metrics.get("total_tax", 0)))
     detail_cols[4].metric("Slippage", _money(metrics.get("total_slippage", 0)))
+
+
+def _render_backtest_diagnostics(
+    st: Any,
+    diagnostics: dict[str, Any],
+    metrics: dict[str, MetricValue],
+) -> None:
+    if not diagnostics:
+        return
+    stats = diagnostics.get("stats")
+    if not isinstance(stats, dict):
+        stats = {}
+    st.write("Data Health")
+    columns = st.columns(5)
+    columns[0].metric("Bars", stats.get("bar_count", 0))
+    columns[1].metric("Trading days", stats.get("trading_days", 0))
+    columns[2].metric("Contracts", len(stats.get("selected_contracts", [])))
+    columns[3].metric("Rolls", stats.get("roll_count", 0))
+    columns[4].metric("Duplicate timestamps", stats.get("duplicate_timestamp_count", 0))
+    st.caption(
+        f"Indicator readiness: EMA {float(stats.get('ema_valid_ratio', 0)):.1%}, "
+        f"ATR {float(stats.get('atr_valid_ratio', 0)):.1%}."
+    )
+    if int(metrics.get("trade_count", 0)) == 0:
+        st.warning("No trades were generated.")
+        st.json(
+            {
+                "bars_loaded": stats.get("bar_count", 0),
+                "trading_days": stats.get("trading_days", 0),
+                "contracts_before_selection": len(stats.get("original_contracts", [])),
+                "contracts_after_selection": len(stats.get("selected_contracts", [])),
+                "segments": stats.get("segment_count", 0),
+                "bars_inside_entry_window": stats.get("entry_window_bars", 0),
+                "atr_valid_ratio": stats.get("atr_valid_ratio", 0),
+                "atr_in_range_ratio": stats.get("atr_in_range_ratio", 0),
+                "long_candidates": stats.get("long_entry_candidates", 0),
+                "short_candidates": stats.get("short_entry_candidates", 0),
+                "buy_signals": stats.get("buy_signals", 0),
+                "sell_signals": stats.get("sell_signals", 0),
+                "primary_reason": diagnostics.get("primary_zero_trade_reason"),
+            }
+        )
+
+
+class _StreamlitProgress:
+    """Throttled-enough per-item renderer for framework-neutral progress callbacks."""
+
+    def __init__(self, st: Any, label: str) -> None:
+        self.status = st.status(label, expanded=True)
+        self.progress = st.progress(0.0, text="Calculating...")
+
+    def __call__(self, update: ProgressUpdate) -> None:
+        percent = update.percent
+        eta = (
+            f"{update.eta_seconds:.1f}s"
+            if update.eta_seconds is not None
+            else "Calculating..."
+        )
+        count = (
+            f"{update.completed} / {update.total}"
+            if update.total is not None
+            else str(update.completed)
+        )
+        text = (
+            f"{update.phase}: {count} | elapsed {update.elapsed_seconds:.1f}s | "
+            f"ETA {eta}"
+        )
+        if percent is not None:
+            self.progress.progress(percent, text=text)
+        else:
+            self.status.write(text)
+        self.status.write(update.message)
+        if update.phase == "Complete":
+            self.status.update(label=update.message, state="complete")
 
 
 def _comparison_record(run: ResultRun, loaded: LoadedResultRun) -> dict[str, object]:
@@ -737,6 +1270,22 @@ def _mapping(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _run_dir_fingerprint(run_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    return tuple(
+        (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(run_dir.iterdir())
+        if path.is_file()
+    )
+
+
+def _load_result_run_cached(
+    run_dir: str,
+    fingerprint: tuple[tuple[str, int, int], ...],
+) -> LoadedResultRun:
+    del fingerprint
+    return load_result_run(run_dir)
 
 
 def _render_charts(
@@ -975,9 +1524,15 @@ def _load_bar_preview(processed_dir: Path, symbol: str, timeframe: str) -> pd.Da
 def _load_chart_bars(config: BacktestConfig) -> pd.DataFrame:
     try:
         bars = load_configured_bars(config)
+        selected = select_contract_bars(
+            bars,
+            contract_mode=config.data.contract_mode,
+            contract=config.data.contract,
+            roll_confirmation_days=config.data.roll_confirmation_days,
+        ).bars
         params: dict[str, object] = dict(config.strategy.params)
         enriched = append_basic_indicators(
-            bars,
+            selected,
             ema_fast=_int_param(params, "ema_fast", 20),
             ema_slow=_int_param(params, "ema_slow", 60),
             atr_period=_int_param(params, "atr_period", 14),

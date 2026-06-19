@@ -67,6 +67,8 @@ def test_loads_repository_backtest_config() -> None:
     assert config.product.point_value == 10
     assert config.product.tick_size == 1
     assert config.portfolio.initial_cash == 100000
+    assert config.data.contract is None
+    assert config.data.roll_confirmation_days == 1
 
 
 def test_accepts_path_object_and_defaults_product_values(tmp_path: Path) -> None:
@@ -119,6 +121,30 @@ def test_rejects_start_date_after_end_date(tmp_path: Path) -> None:
         load_backtest_config(path)
 
 
+def test_single_contract_requires_valid_contract(tmp_path: Path) -> None:
+    raw_config = valid_config()
+    raw_config["data"]["contract_mode"] = "single_contract"
+    path = write_config(tmp_path, raw_config)
+    with pytest.raises(ValidationError, match="contract"):
+        load_backtest_config(path)
+
+    raw_config["data"]["contract"] = "202613"
+    path = write_config(tmp_path, raw_config)
+    with pytest.raises(ValidationError, match="month"):
+        load_backtest_config(path)
+
+    raw_config["data"]["contract"] = "202606"
+    assert load_backtest_config(write_config(tmp_path, raw_config)).data.contract == "202606"
+
+
+def test_continuous_mode_rejects_explicit_contract(tmp_path: Path) -> None:
+    raw_config = valid_config()
+    raw_config["data"]["contract"] = "202606"
+
+    with pytest.raises(ValidationError, match="must be null"):
+        load_backtest_config(write_config(tmp_path, raw_config))
+
+
 def test_rejects_non_mapping_yaml(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
@@ -130,4 +156,3 @@ def test_rejects_non_mapping_yaml(tmp_path: Path) -> None:
 def test_missing_file_raises_config_load_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigLoadError, match="Could not read config file"):
         load_backtest_config(tmp_path / "missing.yaml")
-

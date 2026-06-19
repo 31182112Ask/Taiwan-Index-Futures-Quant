@@ -84,10 +84,12 @@ class VWAPTrendStrategy(BaseStrategy):
         take_profit: float | None = None
         trades_for_day = 0
         current_day: object | None = None
+        current_segment: object | None = None
 
         for row_number, (_, row) in enumerate(working.iterrows()):
             timestamp = pd.Timestamp(row["timestamp"])
             trading_day = timestamp.date()
+            segment = row.get("contract_segment_id")
             if current_day != trading_day:
                 current_day = trading_day
                 trades_for_day = 0
@@ -96,11 +98,23 @@ class VWAPTrendStrategy(BaseStrategy):
                     entry_price = None
                     stop_loss = None
                     take_profit = None
+            if current_segment is not None and segment != current_segment:
+                current_position = 0
+                entry_price = None
+                stop_loss = None
+                take_profit = None
+            current_segment = segment
 
             symbol = str(row["symbol"])
             close = float(row["close"])
             atr_value = float(row["atr"])
             previous_row = working.iloc[row_number - 1] if row_number > 0 else None
+            if (
+                previous_row is not None
+                and "contract_segment_id" in working.columns
+                and previous_row.get("contract_segment_id") != segment
+            ):
+                previous_row = None
 
             signal = _hold_signal(timestamp, symbol, current_position, stop_loss, take_profit)
 

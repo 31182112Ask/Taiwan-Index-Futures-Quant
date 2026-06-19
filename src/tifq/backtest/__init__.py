@@ -1,5 +1,6 @@
 """Conservative historical backtesting components."""
 
+from tifq.backtest.contracts import ContractSelectionResult, select_contract_bars
 from tifq.backtest.cost import CostModel, OrderCost, apply_slippage, calculate_order_cost
 from tifq.backtest.engine import (
     BacktestEngine,
@@ -17,6 +18,7 @@ __all__ = [
     "BacktestResult",
     "BacktestReportPaths",
     "CostModel",
+    "ContractSelectionResult",
     "OrderCost",
     "Portfolio",
     "Trade",
@@ -28,4 +30,5 @@ __all__ = [
     "make_run_id",
     "persist_backtest_result",
     "run_backtest_from_config",
+    "select_contract_bars",
 ]

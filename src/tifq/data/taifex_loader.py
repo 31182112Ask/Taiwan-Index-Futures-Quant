@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -13,6 +13,15 @@ import pandas as pd
 from tifq.data.schemas import TICK_REQUIRED_COLUMNS, V1_SYMBOL
 from tifq.data.storage import tick_path, write_parquet
 from tifq.data.tick_cleaner import clean_tick_frame
+from tifq.runtime.locking import OperationLock
+from tifq.runtime.manifests import (
+    IMPORT_MANIFEST_FILENAME,
+    atomic_write_json,
+    fingerprint_file,
+    load_json_manifest,
+    sha256_file,
+)
+from tifq.runtime.progress import ProgressCallback, ProgressReporter
 
 
 class TaifexImportError(ValueError):
@@ -29,6 +38,13 @@ class ImportSummary:
     output_tick_count: int
     invalid_row_count: int
     output_paths: tuple[Path, ...]
+    files_skipped: int = 0
+    files_changed: int = 0
+    manifest_path: Path | None = None
+    no_op: bool = False
+
+
+PARSER_VERSION = "taifex-v2"
 
 
 _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
@@ -48,10 +64,11 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "contractmonth",
         "delivery_month",
         "deliverymonth",
-        "\u5230\u671f\u6708\u4efd",
-        "\u5230\u671f\u6708\u4efd(\u9031\u5225)",
-        "\u5951\u7d04\u6708\u4efd",
-        "\u5951\u7d04",
+        "到期月份",
+        "到期月份(週別)",
+        "到期月份（週別）",
+        "契約月份",
+        "契約",
     ),
     "timestamp": (
         "timestamp",
@@ -90,9 +107,11 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "quantity",
         "trade_volume",
         "tradevolume",
-        "\u6210\u4ea4\u6578\u91cf",
-        "\u6210\u4ea4\u91cf",
-        "\u6578\u91cf",
+        "成交數量",
+        "成交數量(B+S)",
+        "成交數量（B+S）",
+        "成交量",
+        "數量",
     ),
 }
 
@@ -102,40 +121,111 @@ def import_taifex_ticks(
     processed_dir: str | Path,
     *,
     symbol: str = V1_SYMBOL,
+    force: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> ImportSummary:
-    """Import local TAIFEX CSV/ZIP files into cleaned daily tick Parquet files."""
+    """Incrementally import local TAIFEX files into cleaned daily tick Parquet."""
     if symbol != V1_SYMBOL:
         raise ValueError(f"V1 supports symbol {V1_SYMBOL} only; got: {symbol}")
 
     raw_path = Path(raw_dir)
     processed_path = Path(processed_dir)
     raw_files = discover_taifex_files(raw_path)
+    manifest_path = processed_path / IMPORT_MANIFEST_FILENAME
     if not raw_files:
-        return ImportSummary(0, 0, 0, 0, 0, ())
+        return ImportSummary(0, 0, 0, 0, 0, (), manifest_path=manifest_path, no_op=True)
 
-    normalized_frames: list[pd.DataFrame] = []
+    quarantine = processed_path.parent / "quarantine" / "manifests"
+    manifest = load_json_manifest(
+        manifest_path,
+        default={"version": 1, "records": []},
+        quarantine_dir=quarantine,
+    )
+    records = _import_manifest_records(manifest)
+    reporter = ProgressReporter("taifex_import", progress_callback)
+    reporter.update("Import", 0, len(raw_files), "Planning incremental raw import")
+    output_paths: list[Path] = []
     csv_files_read = 0
-    for path in raw_files:
-        raw_csvs = _read_raw_file(path)
-        csv_files_read += len(raw_csvs)
-        normalized_frames.extend(
-            _normalize_raw_frame(frame, source) for source, frame in raw_csvs
-        )
+    input_rows = 0
+    output_rows = 0
+    invalid_rows = 0
+    files_skipped = 0
+    files_changed = 0
 
-    if not normalized_frames:
-        return ImportSummary(len(raw_files), 0, 0, 0, 0, ())
+    with OperationLock(processed_path.parent / ".runtime", "raw_import"):
+        updated_records = dict(records)
+        for index, path in enumerate(raw_files, start=1):
+            key = str(path.resolve())
+            previous = records.get(key)
+            fingerprint = fingerprint_file(path, previous)
+            if not force and _unchanged_import_record(previous, fingerprint, PARSER_VERSION):
+                files_skipped += 1
+                reporter.update("Import", index, len(raw_files), f"Unchanged: {path.name}")
+                continue
 
-    normalized = pd.concat(normalized_frames, ignore_index=True)
-    clean_result = clean_tick_frame(normalized, symbol=symbol)
-    output_paths = _write_daily_ticks(clean_result.ticks, processed_path, symbol)
+            raw_csvs = _read_raw_file(path)
+            csv_files_read += len(raw_csvs)
+            normalized_frames = [
+                _normalize_raw_frame(frame, source) for source, frame in raw_csvs
+            ]
+            if not normalized_frames:
+                reporter.update("Import", index, len(raw_files), f"No CSV rows: {path.name}")
+                continue
+            normalized = pd.concat(normalized_frames, ignore_index=True)
+            clean_result = clean_tick_frame(normalized, symbol=symbol)
+            source_labels = sorted(set(clean_result.ticks["source"].astype(str)))
+            previous_labels = _string_list(previous, "source_labels")
+            written = _write_daily_ticks_incremental(
+                clean_result.ticks,
+                processed_path,
+                symbol,
+                source_labels=tuple(sorted(set(source_labels + previous_labels))),
+            )
+            output_paths.extend(written)
+            input_rows += clean_result.input_row_count
+            output_rows += len(clean_result.ticks)
+            invalid_rows += clean_result.invalid_row_count
+            files_changed += 1
+            updated_records[key] = {
+                "source_path": key,
+                "size": fingerprint.size,
+                "mtime_ns": fingerprint.mtime_ns,
+                "sha256": fingerprint.sha256,
+                "parser_version": PARSER_VERSION,
+                "imported_at": datetime.now(tz=UTC).isoformat(),
+                "input_rows": clean_result.input_row_count,
+                "output_rows": len(clean_result.ticks),
+                "invalid_rows": clean_result.invalid_row_count,
+                "source_labels": source_labels,
+                "output_paths": [str(output.resolve()) for output in written],
+                "output_hashes": {
+                    str(output.resolve()): sha256_file(output) for output in written
+                },
+            }
+            reporter.update("Import", index, len(raw_files), f"Imported: {path.name}")
 
+        if files_changed:
+            atomic_write_json(
+                manifest_path,
+                {
+                    "version": 1,
+                    "parser_version": PARSER_VERSION,
+                    "records": list(updated_records.values()),
+                },
+            )
+    reporter.update("Complete", len(raw_files), len(raw_files), "TAIFEX import complete")
+    unique_outputs = tuple(sorted(set(output_paths)))
     return ImportSummary(
         files_discovered=len(raw_files),
         csv_files_read=csv_files_read,
-        input_row_count=clean_result.input_row_count,
-        output_tick_count=len(clean_result.ticks),
-        invalid_row_count=clean_result.invalid_row_count,
-        output_paths=tuple(output_paths),
+        input_row_count=input_rows,
+        output_tick_count=output_rows,
+        invalid_row_count=invalid_rows,
+        output_paths=unique_outputs,
+        files_skipped=files_skipped,
+        files_changed=files_changed,
+        manifest_path=manifest_path,
+        no_op=files_changed == 0,
     )
 
 
@@ -312,6 +402,68 @@ def _write_daily_ticks(df: pd.DataFrame, processed_dir: Path, symbol: str) -> li
         write_parquet(daily_ticks.reset_index(drop=True), output_path)
         output_paths.append(output_path)
     return output_paths
+
+
+def _write_daily_ticks_incremental(
+    df: pd.DataFrame,
+    processed_dir: Path,
+    symbol: str,
+    *,
+    source_labels: tuple[str, ...],
+) -> list[Path]:
+    if df.empty:
+        return []
+    output_paths: list[Path] = []
+    for trading_date, daily_ticks in df.groupby(df["timestamp"].dt.date, sort=True):
+        output_path = tick_path(processed_dir, symbol, _ensure_date(trading_date))
+        frames = [daily_ticks]
+        if output_path.exists():
+            existing = pd.read_parquet(output_path)
+            existing = existing.loc[~existing["source"].astype(str).isin(source_labels)]
+            if not existing.empty:
+                frames.insert(0, existing)
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.drop_duplicates().sort_values("timestamp", kind="mergesort")
+        write_parquet(combined.reset_index(drop=True), output_path)
+        output_paths.append(output_path)
+    return output_paths
+
+
+def _import_manifest_records(manifest: object) -> dict[str, dict[str, object]]:
+    if not isinstance(manifest, dict):
+        return {}
+    raw_records = manifest.get("records")
+    if not isinstance(raw_records, list):
+        return {}
+    records: dict[str, dict[str, object]] = {}
+    for record in raw_records:
+        if isinstance(record, dict) and isinstance(record.get("source_path"), str):
+            records[str(record["source_path"])] = record
+    return records
+
+
+def _unchanged_import_record(
+    record: dict[str, object] | None,
+    fingerprint: object,
+    parser_version: str,
+) -> bool:
+    if record is None:
+        return False
+    if record.get("parser_version") != parser_version:
+        return False
+    if record.get("sha256") != getattr(fingerprint, "sha256", None):
+        return False
+    paths = _string_list(record, "output_paths")
+    return bool(paths) and all(Path(path).exists() for path in paths)
+
+
+def _string_list(record: dict[str, object] | None, key: str) -> list[str]:
+    if record is None:
+        return []
+    value = record.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
 
 
 def _ensure_date(value: object) -> date:

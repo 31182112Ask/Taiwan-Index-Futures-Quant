@@ -1258,3 +1258,26 @@ Rules:
   identical result data.
 * UI changes must be exercised in a real browser, checked for terminal exceptions, and verified with
   screenshots before completion.
+
+---
+
+# 26. V1 Data Lifecycle And Runtime Invariants
+
+The following rules are mandatory for all V1 maintenance:
+
+* Never mix multiple contracts directly by timestamp into one strategy sequence. Contract selection
+  must produce at most one active contract per timestamp and one active contract per trading day.
+* EMA, ATR, realized volatility, and strategy previous-row logic must not cross a
+  `contract_segment_id` boundary.
+* Startup cleanup may delete only explicitly allowlisted disposable artifacts. Raw CSV/ZIP,
+  processed Parquet, manifests, and result runs must never be automatically permanently deleted.
+* Duplicate or conflicting valuable files require a dry-run plan and explicit confirmation; the
+  default confirmed action is quarantine, not deletion.
+* Core functions expose progress through optional callbacks and must not import Streamlit.
+* An unchanged import or bar build must be a true no-op and must not rewrite output Parquet.
+* UI caches must be invalidated by path, size, and nanosecond-mtime fingerprints.
+* Result Browser charts and diagnostics must use persisted run artifacts, not recomputed current
+  processed data.
+* Long operations must expose phase, completed/total when known, elapsed time, and factual ETA when
+  enough samples exist. Do not add artificial delays.
+* UI changes require real browser interaction, screenshots, and terminal-log inspection.

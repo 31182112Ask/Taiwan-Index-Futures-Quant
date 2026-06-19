@@ -11,10 +11,16 @@ from tifq.data.schemas import V1_SYMBOL, V1_TIMEFRAMES
 
 
 def write_parquet(df: pd.DataFrame, path: str | Path) -> None:
-    """Write a DataFrame to Parquet, creating parent directories if needed."""
+    """Atomically write Parquet, creating parent directories if needed."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(output_path, index=False)
+    part_path = output_path.with_name(output_path.name + ".part")
+    try:
+        df.to_parquet(part_path, index=False)
+        part_path.replace(output_path)
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
 
 
 def read_parquet(path: str | Path) -> pd.DataFrame:
@@ -40,4 +46,3 @@ def bar_path(processed_dir: Path, symbol: str, timeframe: str, date: date) -> Pa
 def _validate_symbol(symbol: str) -> None:
     if symbol != V1_SYMBOL:
         raise ValueError(f"V1 supports symbol {V1_SYMBOL} only; got: {symbol}")
-

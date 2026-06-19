@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
 
+from tifq.backtest.contracts import select_contract_bars
 from tifq.backtest.cost import CostModel
+from tifq.backtest.diagnostics import build_backtest_diagnostics
 from tifq.backtest.metrics import calculate_metrics
 from tifq.backtest.portfolio import Portfolio, PositionSide
 from tifq.config.models import BacktestConfig
 from tifq.data.schemas import V1_SYMBOL, validate_bar_frame
 from tifq.data.storage import read_parquet
 from tifq.indicators import append_basic_indicators
+from tifq.runtime.manifests import sha256_file
+from tifq.runtime.progress import ProgressCallback, ProgressReporter
 from tifq.strategy.signals import validate_signal_frame
 from tifq.strategy.vwap_trend import VWAPTrendStrategy
 
@@ -27,6 +32,12 @@ class BacktestResult:
     trades: pd.DataFrame
     equity_curve: pd.DataFrame
     metrics: dict[str, float | int]
+    model_bars: pd.DataFrame = field(default_factory=pd.DataFrame)
+    signals: pd.DataFrame = field(default_factory=pd.DataFrame)
+    contract_selection: pd.DataFrame = field(default_factory=pd.DataFrame)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
+    data_fingerprint: dict[str, Any] = field(default_factory=dict)
 
 
 class BacktestEngine:
@@ -40,6 +51,7 @@ class BacktestEngine:
         max_position: int = 1,
         allow_short: bool = True,
         max_trades_per_day: int | None = None,
+        assumed_margin_per_contract: float | None = None,
     ) -> None:
         if max_position < 0:
             raise ValueError("max_position must be non-negative")
@@ -50,6 +62,8 @@ class BacktestEngine:
         self.max_position = max_position
         self.allow_short = allow_short
         self.max_trades_per_day = max_trades_per_day
+        self.assumed_margin_per_contract = assumed_margin_per_contract
+        self.rejection_counts: dict[str, int] = {}
 
     @classmethod
     def from_config(cls, config: BacktestConfig) -> BacktestEngine:
@@ -65,6 +79,7 @@ class BacktestEngine:
             max_position=config.portfolio.max_position,
             allow_short=config.portfolio.allow_short,
             max_trades_per_day=_optional_int(config.strategy.params.get("max_trades_per_day")),
+            assumed_margin_per_contract=config.portfolio.assumed_margin_per_contract,
         )
 
     def run(self, bars: pd.DataFrame, signals: pd.DataFrame) -> BacktestResult:
@@ -73,6 +88,11 @@ class BacktestEngine:
         working_signals = _prepare_signals(signals)
         if len(working_bars) != len(working_signals):
             raise ValueError("bars and signals must have the same number of rows")
+        if not pd.to_datetime(working_bars["timestamp"]).equals(
+            pd.to_datetime(working_signals["timestamp"])
+        ):
+            raise ValueError("bars and signals timestamps must align exactly")
+        self.rejection_counts = {}
 
         portfolio = Portfolio(self.initial_cash)
         trade_counts: dict[date, int] = {}
@@ -105,7 +125,12 @@ class BacktestEngine:
         trades = portfolio.trades_frame()
         equity_curve = pd.DataFrame(equity_rows)
         metrics = calculate_metrics(self.initial_cash, trades, equity_curve)
-        return BacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+        return BacktestResult(
+            trades=trades,
+            equity_curve=equity_curve,
+            metrics=metrics,
+            diagnostics={"execution_rejections": dict(self.rejection_counts)},
+        )
 
     def _execute_signal(
         self,
@@ -135,6 +160,11 @@ class BacktestEngine:
         if abs(target_position) > self.max_position:
             return
         if target_position < 0 and not self.allow_short:
+            self._record_rejection("short_disabled")
+            return
+        required_margin = self.assumed_margin_per_contract
+        if required_margin is not None and portfolio.cash < required_margin * abs(target_position):
+            self._record_rejection("insufficient_assumed_margin")
             return
 
         trading_day = execution_time.date()
@@ -154,24 +184,79 @@ class BacktestEngine:
             cost_model=self.cost_model,
         )
 
+    def _record_rejection(self, reason: str) -> None:
+        self.rejection_counts[reason] = self.rejection_counts.get(reason, 0) + 1
 
-def run_backtest_from_config(config: BacktestConfig) -> BacktestResult:
+
+def run_backtest_from_config(
+    config: BacktestConfig,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> BacktestResult:
     """Load configured bars, calculate indicators, run strategy, and execute signals."""
     if config.strategy.name != "vwap_trend":
         raise ValueError("Task 8 supports the vwap_trend strategy only")
 
+    reporter = ProgressReporter("backtest", progress_callback)
+    timings: dict[str, float] = {}
+    reporter.update("Preflight", 0, 6, "Loading configured bars")
+    started = perf_counter()
     bars = load_configured_bars(config)
-    params: dict[str, object] = dict(config.strategy.params)
-    enriched_bars = append_basic_indicators(
+    timings["bar_loading"] = perf_counter() - started
+    reporter.update("Select contracts", 1, 6, "Selecting active TMF contracts")
+    started = perf_counter()
+    selection = select_contract_bars(
         bars,
+        contract_mode=config.data.contract_mode,
+        contract=config.data.contract,
+        roll_confirmation_days=config.data.roll_confirmation_days,
+    )
+    timings["contract_selection"] = perf_counter() - started
+    params: dict[str, object] = dict(config.strategy.params)
+    reporter.update("Calculate indicators", 2, 6, "Calculating segment-safe indicators")
+    started = perf_counter()
+    enriched_bars = append_basic_indicators(
+        selection.bars,
         ema_fast=_int_param(params, "ema_fast", 20),
         ema_slow=_int_param(params, "ema_slow", 60),
         atr_period=_int_param(params, "atr_period", 14),
         volatility_window=_int_param(params, "volatility_window", 20),
     )
+    timings["indicator_calculation"] = perf_counter() - started
+    reporter.update("Generate signals", 3, 6, "Generating VWAP Trend signals")
+    started = perf_counter()
     strategy = VWAPTrendStrategy.from_config_params(params)
     signals = strategy.generate_signals(enriched_bars)
-    return BacktestEngine.from_config(config).run(enriched_bars, signals)
+    signals["contract"] = enriched_bars["contract"].to_numpy()
+    signals["contract_segment_id"] = enriched_bars["contract_segment_id"].to_numpy()
+    timings["signal_generation"] = perf_counter() - started
+    diagnostics = build_backtest_diagnostics(bars, selection, enriched_bars, signals, config)
+    if diagnostics["errors"]:
+        raise ValueError("Backtest preflight failed: " + "; ".join(diagnostics["errors"]))
+    reporter.update("Execute backtest", 4, 6, "Executing next-bar-open simulation")
+    started = perf_counter()
+    execution = BacktestEngine.from_config(config).run(enriched_bars, signals)
+    timings["backtest_execution"] = perf_counter() - started
+    diagnostics["execution_rejections"] = execution.diagnostics.get(
+        "execution_rejections", {}
+    )
+    if (
+        execution.metrics.get("trade_count", 0) == 0
+        and diagnostics["execution_rejections"].get("insufficient_assumed_margin", 0)
+    ):
+        diagnostics["primary_zero_trade_reason"] = "assumed margin insufficient"
+    reporter.update("Complete", 6, 6, "Backtest complete")
+    return BacktestResult(
+        trades=execution.trades,
+        equity_curve=execution.equity_curve,
+        metrics=execution.metrics,
+        model_bars=enriched_bars,
+        signals=signals,
+        contract_selection=selection.audit,
+        diagnostics=diagnostics,
+        timings=timings,
+        data_fingerprint=_data_fingerprint(config),
+    )
 
 
 def load_configured_bars(config: BacktestConfig) -> pd.DataFrame:
@@ -233,7 +318,10 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
     validate_bar_frame(bars)
     if bars.empty:
         raise ValueError("bars must not be empty")
-    return bars.copy().sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    prepared = bars.copy().sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    if pd.to_datetime(prepared["timestamp"]).duplicated().any():
+        raise ValueError("bars contain duplicate active timestamps")
+    return prepared
 
 
 def _prepare_signals(signals: pd.DataFrame) -> pd.DataFrame:
@@ -272,3 +360,26 @@ def _optional_int(value: object) -> int | None:
     if isinstance(value, str | int):
         return int(value)
     raise ValueError(f"max_trades_per_day must be an integer; got: {value}")
+
+
+def _data_fingerprint(config: BacktestConfig) -> dict[str, Any]:
+    paths = discover_bar_files(
+        config.data.processed_dir,
+        symbol=config.data.symbol,
+        timeframe=config.data.timeframe,
+        start_date=config.data.start_date,
+        end_date=config.data.end_date,
+    )
+    return {
+        "source_bar_paths": [str(path.resolve()) for path in paths],
+        "source_hashes": {str(path.resolve()): sha256_file(path) for path in paths},
+        "contract_mode": config.data.contract_mode,
+        "selected_contract": config.data.contract,
+        "indicator_params": {
+            key: config.strategy.params.get(key)
+            for key in ("ema_fast", "ema_slow", "atr_period", "volatility_window")
+        },
+        "strategy_params": dict(config.strategy.params),
+        "cost_params": config.cost.model_dump(mode="json"),
+        "package_version": "0.1.0",
+    }

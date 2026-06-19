@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import yaml
 
 from tifq.backtest import BacktestResult, persist_backtest_result
@@ -90,7 +91,58 @@ def test_persist_backtest_result_writes_required_files(tmp_path: Path) -> None:
     assert paths.trades_path.exists()
     assert paths.equity_curve_path.exists()
     assert paths.metrics_path.exists()
+    assert paths.model_bars_path.exists()
+    assert paths.signals_path.exists()
+    assert paths.contract_selection_path.exists()
+    assert paths.diagnostics_path.exists()
+    assert paths.timings_path.exists()
+    assert paths.data_fingerprint_path.exists()
     assert yaml.safe_load(paths.config_path.read_text(encoding="utf-8"))["data"]["symbol"] == "TMF"
     assert pd.read_csv(paths.trades_path).loc[0, "exit_reason"] == "take_profit"
     assert pd.read_csv(paths.equity_curve_path).loc[0, "equity"] == 100_026.0
     assert json.loads(paths.metrics_path.read_text(encoding="utf-8"))["trade_count"] == 1
+
+
+def test_report_failure_removes_staging_and_never_publishes_partial_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = config_for_tmp_path(tmp_path)
+    result = BacktestResult(
+        trades=pd.DataFrame({"net_pnl": [1.0]}),
+        equity_curve=pd.DataFrame({"equity": [100_001.0]}),
+        metrics={"trade_count": 1},
+    )
+
+    def fail_to_csv(*args: object, **kwargs: object) -> None:
+        raise OSError("disk failure")
+
+    monkeypatch.setattr(result.trades, "to_csv", fail_to_csv)
+
+    with pytest.raises(OSError, match="disk failure"):
+        persist_backtest_result(config, result, run_id="failed-run")
+
+    strategy_dir = tmp_path / "results" / "backtests" / "vwap_trend"
+    assert not (strategy_dir / "failed-run").exists()
+    assert not (strategy_dir / ".failed-run.staging").exists()
+
+
+def test_persist_backtest_result_reports_artifact_progress(tmp_path: Path) -> None:
+    config = config_for_tmp_path(tmp_path)
+    result = BacktestResult(
+        trades=pd.DataFrame(),
+        equity_curve=pd.DataFrame(),
+        metrics={"trade_count": 0},
+    )
+    updates = []
+
+    persist_backtest_result(
+        config,
+        result,
+        run_id="progress-run",
+        progress_callback=updates.append,
+    )
+
+    assert updates[0].phase == "Persist report"
+    assert updates[-1].phase == "Complete"
+    assert updates[-1].completed == updates[-1].total == 10

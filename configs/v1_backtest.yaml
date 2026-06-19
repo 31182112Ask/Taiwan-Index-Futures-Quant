@@ -5,6 +5,8 @@ project:
 data:
   symbol: TMF
   contract_mode: continuous_front_month
+  contract: null
+  roll_confirmation_days: 1
   raw_dir: data/raw/taifex
   processed_dir: data/processed
   start_date: "2026-05-18"
@@ -41,4 +43,4 @@ portfolio:
   initial_cash: 100000
   max_position: 1
   allow_short: true
-
+  assumed_margin_per_contract: null
