@@ -479,6 +479,13 @@ def _render_official_sync(st: Any, config: BacktestConfig) -> None:
         import_summary = None
         bar_summary = None
         if full_sync:
+            if fetch_summary.files_failed:
+                status.update(
+                    label="Official TAIFEX sync completed with failures.",
+                    state="error",
+                )
+                st.json(_sync_display_payload(fetch_summary, None, None))
+                return
             import_summary = import_taifex_ticks(
                 config.data.raw_dir,
                 config.data.processed_dir,

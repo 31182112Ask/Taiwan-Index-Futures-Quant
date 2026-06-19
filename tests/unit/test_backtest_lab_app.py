@@ -10,6 +10,7 @@ import yaml
 from tifq.apps.backtest_lab import (
     ResultRun,
     _load_chart_bars,
+    _sync_display_payload,
     build_config_override,
     build_run_comparison_table,
     discover_raw_files,
@@ -17,6 +18,7 @@ from tifq.apps.backtest_lab import (
     load_result_run,
 )
 from tifq.config.models import BacktestConfig
+from tifq.data.taifex_fetcher import TaifexDownloadFailure, TaifexFetchSummary
 
 
 def base_config(tmp_path: Path) -> BacktestConfig:
@@ -207,6 +209,36 @@ def test_load_chart_bars_calculates_indicators_before_tail(
     assert observed_lengths == [600]
     assert len(chart_bars) == 500
     assert chart_bars.loc[0, "ema_fast"] == 100
+
+
+def test_sync_display_payload_keeps_import_and_build_empty_when_downloads_fail(
+    tmp_path: Path,
+) -> None:
+    summary = TaifexFetchSummary(
+        files_discovered=2,
+        files_selected=2,
+        files_downloaded=1,
+        files_skipped=0,
+        files_updated=0,
+        files_failed=1,
+        records=(),
+        failures=(
+            TaifexDownloadFailure(
+                trading_date=date(2026, 6, 17),
+                download_url="https://www.taifex.com.tw/file/Daily_20260617.csv",
+                remote_filename="Daily_20260617.csv",
+                local_path=tmp_path / "Daily_20260617.csv",
+                error="HTML error page",
+            ),
+        ),
+    )
+
+    payload = _sync_display_payload(summary, None, None)
+
+    assert payload["failed"] == 1
+    assert payload["failures"][0]["error"] == "HTML error page"
+    assert "imported_tick_count" not in payload
+    assert "built_bar_count" not in payload
 
 
 def write_result_run(run_dir: Path, *, ema_fast: int = 20, net_pnl: float = 500.0) -> None:

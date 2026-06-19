@@ -35,6 +35,21 @@ def row(
     )
 
 
+def onclick_row(trading_date: str) -> str:
+    return (
+        "<tr>"
+        f"<td align='center'>{trading_date} PM 04:43:39</td>"
+        f"<td align='center'>{trading_date}</td>"
+        "<td align='center'><input type='button' value='下載' "
+        "onClick=\"javascript:window.open('https://www.taifex.com.tw/file/taifex/"
+        "Dailydownload/Dailydownload/Daily_2026_06_18.zip')\"></td>"
+        "<td align='center'><input type='button' value='下載' "
+        "onClick=\"javascript:window.open('https://www.taifex.com.tw/file/taifex/"
+        "Dailydownload/DailydownloadCSV/Daily_2026_06_18.zip')\"></td>"
+        "</tr>"
+    )
+
+
 def mock_client(html: str) -> httpx.Client:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=html, request=request)
@@ -87,6 +102,20 @@ def test_discovers_csv_links_only_and_resolves_relative_urls() -> None:
     assert files[0].trading_date.isoformat() == "2026-06-17"
     assert files[0].download_url == "https://www.taifex.com.tw/file/Daily_20260617.csv"
     assert files[0].remote_filename == "Daily_20260617.csv"
+
+
+def test_discovers_official_onclick_csv_zip_and_ignores_rpt_zip() -> None:
+    html = official_page(onclick_row("2026/06/18"))
+
+    files = discover_recent_taifex_csv_files(limit=30, client=mock_client(html))
+
+    assert len(files) == 1
+    assert files[0].trading_date.isoformat() == "2026-06-18"
+    assert files[0].download_url == (
+        "https://www.taifex.com.tw/file/taifex/Dailydownload/"
+        "DailydownloadCSV/Daily_2026_06_18.zip"
+    )
+    assert files[0].remote_filename == "Daily_2026_06_18.zip"
 
 
 def test_rejects_external_domain_links_and_deduplicates_dates() -> None:

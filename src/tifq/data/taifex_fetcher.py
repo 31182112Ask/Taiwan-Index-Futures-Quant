@@ -26,6 +26,7 @@ _DATE_PATTERNS = (
     re.compile(r"(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})"),
     re.compile(r"(?<!\d)(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})(?!\d)"),
 )
+_SCRIPT_URL_RE = re.compile(r"""['"](?P<url>https?://[^'"]+|/[^'"]+)['"]""")
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -192,20 +193,38 @@ def _remote_files_from_container(container: Any, source_url: str) -> list[Taifex
     text = container.get_text(" ", strip=True)
     row_date = _extract_trading_date(text)
     files: list[TaifexRemoteFile] = []
-    for anchor in container.find_all("a"):
-        href = str(anchor.get("href") or "").strip()
-        label = anchor.get_text(" ", strip=True)
-        if not _looks_like_csv_link(href, label):
-            continue
-        download_url = _validated_taifex_url(href, source_url)
-        if download_url is None:
-            continue
-        filename = _remote_filename(download_url)
-        trading_date = row_date or _extract_trading_date(f"{filename} {download_url}")
-        if trading_date is None:
-            continue
-        files.append(TaifexRemoteFile(trading_date, download_url, filename))
+    for element in container.find_all(["a", "button", "input"]):
+        label = _element_label(element)
+        for href in _element_download_targets(element):
+            if not _looks_like_csv_link(href, label):
+                continue
+            download_url = _validated_taifex_url(href, source_url)
+            if download_url is None:
+                continue
+            filename = _remote_filename(download_url)
+            trading_date = row_date or _extract_trading_date(f"{filename} {download_url}")
+            if trading_date is None:
+                continue
+            files.append(TaifexRemoteFile(trading_date, download_url, filename))
     return files
+
+
+def _element_label(element: Any) -> str:
+    text = element.get_text(" ", strip=True)
+    value = str(element.get("value") or "")
+    title = str(element.get("title") or "")
+    return " ".join(part for part in (text, value, title) if part)
+
+
+def _element_download_targets(element: Any) -> list[str]:
+    targets: list[str] = []
+    href = str(element.get("href") or "").strip()
+    if href:
+        targets.append(href)
+
+    onclick = str(element.get("onclick") or element.get("onClick") or "").strip()
+    targets.extend(match.group("url").strip() for match in _SCRIPT_URL_RE.finditer(onclick))
+    return targets
 
 
 def _looks_like_csv_link(href: str, label: str) -> bool:
@@ -214,6 +233,8 @@ def _looks_like_csv_link(href: str, label: str) -> bool:
         return False
     if ".rpt" in combined or "rpt" == label.strip().lower():
         return False
+    if "dailydownloadcsv" in combined:
+        return href.lower().endswith((".csv", ".zip"))
     return ".csv" in combined or "csv" in label.strip().lower()
 
 
