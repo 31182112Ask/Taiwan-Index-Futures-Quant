@@ -41,6 +41,13 @@ data/results/**
 !data/results/backtests/
 !data/results/backtests/.gitkeep
 
+data/smoke/
+data/test-runtime/
+artifacts/ui/
+*.parquet
+download_manifest.json
+*.part
+
 logs/**
 !logs/
 !logs/.gitkeep
@@ -50,4 +57,3 @@ logs/**
 Thumbs.db
 .idea/
 .vscode/
-

@@ -11,9 +11,10 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup
 
 TAIFEX_RECENT_FUTURES_URL = "https://www.taifex.com.tw/cht/3/dlFutPrevious30DaysSalesData"
 TAIFEX_HOST = "www.taifex.com.tw"
@@ -21,6 +22,7 @@ USER_AGENT = "Taiwan-Index-Futures-Quant/0.1 local research data sync"
 MANIFEST_FILENAME = "download_manifest.json"
 MAX_RECENT_FILES = 30
 MAX_DOWNLOAD_ATTEMPTS = 3
+TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
 
 _DATE_PATTERNS = (
     re.compile(r"(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})"),
@@ -96,7 +98,8 @@ def discover_recent_taifex_csv_files(
             "TAIFEX discovery",
         )
         discovered = parse_recent_taifex_csv_files(response.text, TAIFEX_RECENT_FUTURES_URL)
-        return discovered[:limit]
+        completed = [file for file in discovered if file.trading_date <= _taipei_today()]
+        return completed[:limit]
     finally:
         if owns_client:
             active_client.close()
@@ -485,3 +488,7 @@ def _request_headers() -> dict[str, str]:
 def _validate_limit(limit: int) -> None:
     if not 1 <= limit <= MAX_RECENT_FILES:
         raise ValueError("limit must be between 1 and 30")
+
+
+def _taipei_today() -> date:
+    return datetime.now(tz=TAIPEI_TIMEZONE).date()

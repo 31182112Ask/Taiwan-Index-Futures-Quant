@@ -5,11 +5,15 @@ from datetime import date, time
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
+import pytest
 import yaml
 
 from tifq.apps.backtest_lab import (
     ResultRun,
+    _element_key,
     _load_chart_bars,
+    _render_charts,
     _sync_display_payload,
     build_config_override,
     build_run_comparison_table,
@@ -19,6 +23,55 @@ from tifq.apps.backtest_lab import (
 )
 from tifq.config.models import BacktestConfig
 from tifq.data.taifex_fetcher import TaifexDownloadFailure, TaifexFetchSummary
+
+
+class ChartRecorder:
+    def __init__(self) -> None:
+        self.plotly_keys: list[str] = []
+        self.line_keys: list[str] = []
+        self.bar_keys: list[str] = []
+
+    def plotly_chart(self, figure: object, *, key: str, **kwargs: object) -> None:
+        self.plotly_keys.append(key)
+
+    def line_chart(self, data: object, *, key: str) -> None:
+        self.line_keys.append(key)
+
+    def bar_chart(self, data: object, *, key: str) -> None:
+        self.bar_keys.append(key)
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def write(self, message: str) -> None:
+        pass
+
+
+class LegacyNativeChartRecorder:
+    def __init__(self) -> None:
+        self.vega_keys: list[str] = []
+
+    def line_chart(self, data: object) -> None:
+        raise AssertionError("line_chart without a key must not be used")
+
+    def bar_chart(self, data: object) -> None:
+        raise AssertionError("bar_chart without a key must not be used")
+
+    def vega_lite_chart(
+        self,
+        data: object,
+        spec: object,
+        *,
+        key: str,
+        **kwargs: object,
+    ) -> None:
+        self.vega_keys.append(key)
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def write(self, message: str) -> None:
+        pass
 
 
 def base_config(tmp_path: Path) -> BacktestConfig:
@@ -239,6 +292,150 @@ def test_sync_display_payload_keeps_import_and_build_empty_when_downloads_fail(
     assert payload["failures"][0]["error"] == "HTML error page"
     assert "imported_tick_count" not in payload
     assert "built_bar_count" not in payload
+
+
+def test_render_charts_requires_key_prefix() -> None:
+    recorder = ChartRecorder()
+
+    with pytest.raises(TypeError, match="key_prefix"):
+        _render_charts(recorder, go, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+
+
+def test_plotly_chart_keys_are_unique_across_backtest_and_result_browser() -> None:
+    equity_curve, trades, bars = chart_frames()
+    backtest = ChartRecorder()
+    result_browser = ChartRecorder()
+
+    _render_charts(
+        backtest,
+        go,
+        equity_curve,
+        trades,
+        bars,
+        key_prefix="run_backtest",
+    )
+    _render_charts(
+        result_browser,
+        go,
+        equity_curve,
+        trades,
+        bars,
+        key_prefix="result_browser_run-001",
+    )
+
+    assert backtest.plotly_keys == [
+        "run_backtest_equity_curve",
+        "run_backtest_daily_pnl",
+        "run_backtest_kline",
+    ]
+    assert result_browser.plotly_keys == [
+        "result_browser_run-001_equity_curve",
+        "result_browser_run-001_daily_pnl",
+        "result_browser_run-001_kline",
+    ]
+    assert set(backtest.plotly_keys).isdisjoint(result_browser.plotly_keys)
+
+
+def test_result_browser_run_ids_produce_different_stable_chart_keys() -> None:
+    equity_curve, trades, bars = chart_frames()
+    first = ChartRecorder()
+    repeated = ChartRecorder()
+    second = ChartRecorder()
+
+    for recorder, run_id in ((first, "run:001"), (repeated, "run:001"), (second, "run/002")):
+        _render_charts(
+            recorder,
+            go,
+            equity_curve,
+            trades,
+            bars,
+            key_prefix=f"result_browser_{run_id}",
+        )
+
+    assert first.plotly_keys == repeated.plotly_keys
+    assert set(first.plotly_keys).isdisjoint(second.plotly_keys)
+
+
+def test_native_fallback_chart_keys_are_unique() -> None:
+    equity_curve, trades, bars = chart_frames()
+    recorder = ChartRecorder()
+
+    _render_charts(
+        recorder,
+        None,
+        equity_curve,
+        trades,
+        bars,
+        key_prefix="native/run 001",
+    )
+
+    assert recorder.line_keys == [
+        "native_run_001_native_equity",
+        "native_run_001_native_indicators",
+    ]
+    assert recorder.bar_keys == ["native_run_001_native_daily_pnl"]
+
+
+def test_native_fallback_uses_keyed_vega_when_streamlit_chart_api_has_no_key() -> None:
+    equity_curve, trades, bars = chart_frames()
+    recorder = LegacyNativeChartRecorder()
+
+    _render_charts(
+        recorder,
+        None,
+        equity_curve,
+        trades,
+        bars,
+        key_prefix="legacy_native",
+    )
+
+    assert recorder.vega_keys == [
+        "legacy_native_native_equity",
+        "legacy_native_native_daily_pnl",
+        "legacy_native_native_indicators",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("run 001", "run_001"),
+        ("strategy/run:001", "strategy_run_001"),
+        ("run#001", "run_001"),
+        ("2026-06-19T08:45:00+08:00", "2026-06-19T08_45_00_08_00"),
+        ("", "element"),
+    ],
+)
+def test_element_key_is_safe_and_deterministic(value: str, expected: str) -> None:
+    assert _element_key(value) == expected
+    assert _element_key(value) == expected
+
+
+def chart_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    timestamp = pd.Timestamp("2026-06-17 09:00:00", tz="Asia/Taipei")
+    equity_curve = pd.DataFrame({"timestamp": [timestamp], "equity": [100_100.0]})
+    trades = pd.DataFrame(
+        {
+            "entry_time": [timestamp],
+            "exit_time": [timestamp + pd.Timedelta(minutes=5)],
+            "entry_price": [22_000.0],
+            "exit_price": [22_010.0],
+            "net_pnl": [100.0],
+        }
+    )
+    bars = pd.DataFrame(
+        {
+            "timestamp": [timestamp],
+            "open": [22_000.0],
+            "high": [22_012.0],
+            "low": [21_998.0],
+            "close": [22_010.0],
+            "vwap": [22_005.0],
+            "ema_fast": [22_006.0],
+            "ema_slow": [22_004.0],
+        }
+    )
+    return equity_curve, trades, bars
 
 
 def write_result_run(run_dir: Path, *, ema_fast: int = 20, net_pnl: float = 500.0) -> None:

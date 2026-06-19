@@ -1240,3 +1240,21 @@ Implementation rules:
 * Future chart rendering should consume structured bar, indicator, signal, model, and trade events.
 * A replay/chart event stream should be introduced before the final Backtest Lab UI.
 * Task 6 should only prepare indicator data; it must not implement replay or UI.
+
+---
+
+# 25. Streamlit Element Identity Rules
+
+Streamlit elements that may be rendered more than once in one script run must use explicit,
+deterministic keys. This includes equivalent charts or tables rendered in separate tabs.
+
+Rules:
+
+* Treat every tab body as part of the same Streamlit script run, including tabs that are not selected.
+* Dynamic strategy names and result run IDs must pass through a key sanitizer before use.
+* Sanitized keys may contain only `A-Z`, `a-z`, `0-9`, `_`, and `-`.
+* Do not use UUIDs, random values, timestamps, or other values that change between reruns as keys.
+* Run Backtest and Result Browser elements must have distinct key prefixes even when they display
+  identical result data.
+* UI changes must be exercised in a real browser, checked for terminal exceptions, and verified with
+  screenshots before completion.

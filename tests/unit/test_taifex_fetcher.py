@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -144,6 +145,21 @@ def test_preserves_official_newest_to_oldest_order_and_applies_limit() -> None:
         "2026-06-18",
         "2026-06-17",
     ]
+
+
+def test_discovery_excludes_future_trading_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "tifq.data.taifex_fetcher._taipei_today",
+        lambda: date(2026, 6, 19),
+    )
+    html = official_page(
+        row("2026/06/22", "/file/Daily_20260622.csv"),
+        row("2026/06/18", "/file/Daily_20260618.csv"),
+    )
+
+    files = discover_recent_taifex_csv_files(limit=1, client=mock_client(html))
+
+    assert [file.trading_date for file in files] == [date(2026, 6, 18)]
 
 
 def test_discovery_retries_http_5xx(monkeypatch: pytest.MonkeyPatch) -> None:

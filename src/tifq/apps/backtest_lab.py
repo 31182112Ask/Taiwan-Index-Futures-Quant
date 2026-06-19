@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, time
 from importlib import import_module
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,8 @@ from tifq.data.taifex_fetcher import (
     sync_recent_taifex_csv_files,
 )
 from tifq.indicators import append_basic_indicators
+
+_UNSAFE_ELEMENT_KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 @dataclass(frozen=True)
@@ -426,7 +430,7 @@ def _render_data_import(st: Any, config: BacktestConfig) -> None:
     if raw_files:
         st.dataframe(
             pd.DataFrame({"file": [str(path) for path in raw_files]}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -580,7 +584,7 @@ def _render_bar_builder(st: Any, config: BacktestConfig) -> None:
         config.data.timeframe,
     )
     if not preview.empty:
-        st.dataframe(preview.tail(200), use_container_width=True, hide_index=True)
+        st.dataframe(preview.tail(200), width="stretch", hide_index=True)
 
 
 def _render_strategy_config(st: Any, config: BacktestConfig) -> None:
@@ -614,8 +618,20 @@ def _render_run_backtest(st: Any, go: Any, config: BacktestConfig) -> None:
     if isinstance(result, BacktestResult):
         _render_result_summary(st, result.metrics)
         chart_bars = _load_chart_bars(config)
-        _render_charts(st, go, result.equity_curve, result.trades, chart_bars)
-        st.dataframe(result.trades, use_container_width=True, hide_index=True)
+        _render_charts(
+            st,
+            go,
+            result.equity_curve,
+            result.trades,
+            chart_bars,
+            key_prefix="run_backtest",
+        )
+        st.dataframe(
+            result.trades,
+            width="stretch",
+            hide_index=True,
+            key="run_backtest_trades",
+        )
         st.caption(f"Latest run directory: {st.session_state.get('last_run_dir', '-')}")
     else:
         st.info("Run a backtest to view equity, daily PnL, K-line overlays, and trades.")
@@ -632,9 +648,22 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
     selected_label = st.selectbox("Run", labels)
     selected = runs[labels.index(selected_label)]
     loaded = load_result_run(selected.run_dir)
+    result_key = _element_key(f"result_browser_{selected.run_id}")
     _render_result_summary(st, loaded.metrics)
-    _render_charts(st, go, loaded.equity_curve, loaded.trades, pd.DataFrame())
-    st.dataframe(loaded.trades, use_container_width=True, hide_index=True)
+    _render_charts(
+        st,
+        go,
+        loaded.equity_curve,
+        loaded.trades,
+        pd.DataFrame(),
+        key_prefix=result_key,
+    )
+    st.dataframe(
+        loaded.trades,
+        width="stretch",
+        hide_index=True,
+        key=f"{result_key}_trades",
+    )
     st.caption(str(selected.run_dir))
 
     st.write("Run Comparison")
@@ -652,8 +681,9 @@ def _render_result_browser(st: Any, go: Any, config: BacktestConfig) -> None:
     loaded_runs = [(run, load_result_run(run.run_dir)) for run in selected_runs]
     st.dataframe(
         build_run_comparison_table(loaded_runs),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
+        key="result_comparison_table",
     )
 
 
@@ -715,24 +745,49 @@ def _render_charts(
     equity_curve: pd.DataFrame,
     trades: pd.DataFrame,
     chart_bars: pd.DataFrame,
+    *,
+    key_prefix: str,
 ) -> None:
+    safe_prefix = _element_key(key_prefix)
     if go is not None:
-        st.plotly_chart(_equity_figure(go, equity_curve), use_container_width=True)
-        st.plotly_chart(_daily_pnl_figure(go, trades), use_container_width=True)
+        st.plotly_chart(
+            _equity_figure(go, equity_curve),
+            width="stretch",
+            key=f"{safe_prefix}_equity_curve",
+        )
+        st.plotly_chart(
+            _daily_pnl_figure(go, trades),
+            width="stretch",
+            key=f"{safe_prefix}_daily_pnl",
+        )
         if not chart_bars.empty:
-            st.plotly_chart(_kline_figure(go, chart_bars, trades), use_container_width=True)
+            st.plotly_chart(
+                _kline_figure(go, chart_bars, trades),
+                width="stretch",
+                key=f"{safe_prefix}_kline",
+            )
         return
 
     st.warning("Plotly is not installed in this environment; using Streamlit native charts.")
     if not equity_curve.empty and {"timestamp", "equity"}.issubset(equity_curve.columns):
         st.write("Equity Curve")
-        st.line_chart(equity_curve.set_index("timestamp")["equity"])
+        _render_native_chart(
+            st,
+            "line_chart",
+            equity_curve.set_index("timestamp")["equity"],
+            key=f"{safe_prefix}_native_equity",
+        )
     if not trades.empty and {"exit_time", "net_pnl"}.issubset(trades.columns):
         working = trades.copy()
         working["date"] = pd.to_datetime(working["exit_time"]).dt.date
         daily = working.groupby("date")["net_pnl"].sum()
         st.write("Daily PnL")
-        st.bar_chart(daily)
+        _render_native_chart(
+            st,
+            "bar_chart",
+            daily,
+            key=f"{safe_prefix}_native_daily_pnl",
+        )
     if not chart_bars.empty:
         columns = [
             column
@@ -741,7 +796,60 @@ def _render_charts(
         ]
         if columns:
             st.write("Price and Indicators")
-            st.line_chart(chart_bars.set_index("timestamp")[columns])
+            _render_native_chart(
+                st,
+                "line_chart",
+                chart_bars.set_index("timestamp")[columns],
+                key=f"{safe_prefix}_native_indicators",
+            )
+
+
+def _element_key(value: str) -> str:
+    """Return a deterministic Streamlit key containing only safe characters."""
+    sanitized = _UNSAFE_ELEMENT_KEY_RE.sub("_", value)
+    return sanitized or "element"
+
+
+def _render_native_chart(
+    st: Any,
+    chart_name: str,
+    data: pd.Series[Any] | pd.DataFrame,
+    *,
+    key: str,
+) -> None:
+    chart = getattr(st, chart_name)
+    parameters = signature(chart).parameters.values()
+    supports_key = any(
+        parameter.name == "key" or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_key:
+        chart(data, key=key)
+        return
+
+    frame = data.to_frame() if isinstance(data, pd.Series) else data.copy()
+    index_name = frame.index.name or "index"
+    frame.index.name = index_name
+    value_columns = [str(column) for column in frame.columns]
+    long_frame = frame.reset_index().melt(
+        id_vars=[index_name],
+        value_vars=value_columns,
+        var_name="series",
+        value_name="value",
+    )
+    st.vega_lite_chart(
+        long_frame,
+        {
+            "mark": "bar" if chart_name == "bar_chart" else "line",
+            "encoding": {
+                "x": {"field": index_name, "type": "temporal"},
+                "y": {"field": "value", "type": "quantitative"},
+                "color": {"field": "series", "type": "nominal"},
+            },
+        },
+        width="stretch",
+        key=key,
+    )
 
 
 def _equity_figure(go: Any, equity_curve: pd.DataFrame) -> Any:

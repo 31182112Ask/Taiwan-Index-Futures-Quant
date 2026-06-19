@@ -46,6 +46,19 @@ tifq backtest --config configs/v1_backtest.yaml
 tifq app backtest-lab
 ```
 
+## Backtest Lab
+
+Start the local Streamlit client with either the CLI command above or directly:
+
+```bash
+python -m streamlit run src/tifq/apps/backtest_lab.py
+```
+
+Chart elements use deterministic, explicit keys so Run Backtest and Result Browser can render
+the same persisted result during one Streamlit rerun. Dynamic result run IDs are sanitized before
+they are used in element keys. If Streamlit serves stale cached state during local development,
+stop the process and start the application again before repeating the workflow.
+
 Task 1 completed: project bootstrap.
 Task 2 completed: config loading and validation.
 Task 3 completed: data schemas and Parquet storage helpers.
