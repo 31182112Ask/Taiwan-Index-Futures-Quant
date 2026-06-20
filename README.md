@@ -1,5 +1,9 @@
 # Taiwan Index Futures Quant
 
+> V1 is frozen at `v1.0.0`. V2 Task 0 extracts a framework-neutral application service
+> boundary without changing V1 backtest behavior. Streamlit remains the supported
+> legacy/reference UI; the next approved task is a FastAPI + React vertical slice.
+
 Local quantitative research and historical backtesting project for Taiwan Micro TAIEX Futures (TMF).
 
 Current active stage: **V1 - Backtest Lab**.

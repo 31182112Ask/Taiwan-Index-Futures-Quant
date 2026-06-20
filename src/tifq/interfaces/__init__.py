@@ -1,0 +1,1 @@
+"""External user-interface adapters."""

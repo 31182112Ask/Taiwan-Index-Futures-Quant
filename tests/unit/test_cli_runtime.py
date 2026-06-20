@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 from click import unstyle
 from typer.testing import CliRunner
 
+from tifq.application.dto import DownloadPlanDTO
 from tifq.cli import _workflow_cli_marker, app
 from tifq.data.taifex_fetcher import (
     TaifexDownloadPlan,
@@ -93,10 +95,23 @@ def test_sync_plan_does_not_call_download(monkeypatch, tmp_path: Path) -> None:
             ),
         )
     )
-    monkeypatch.setattr("tifq.cli.plan_recent_taifex_csv_files", lambda *a, **k: plan)
+    dto = DownloadPlanDTO(
+        (
+            {
+                "trading_date": remote.trading_date.isoformat(),
+                "status": "new",
+                "remote_filename": remote.remote_filename,
+                "local_path": str(plan.items[0].local_path),
+                "recommended_action": "download_missing",
+            },
+        ),
+        0,
+        1,
+        0,
+    )
+    pipeline = SimpleNamespace(plan_sync=lambda request: dto)
     monkeypatch.setattr(
-        "tifq.cli.sync_recent_taifex_csv_files",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("download called")),
+        "tifq.cli._application", lambda: SimpleNamespace(data_pipeline=pipeline)
     )
 
     result = runner.invoke(

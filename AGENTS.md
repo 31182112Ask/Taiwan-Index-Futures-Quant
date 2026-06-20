@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## V2 Task 0 Application Boundary
+
+- External interfaces call business workflows through `tifq.application`.
+- Application and core modules must not import Streamlit, Plotly, FastAPI, React, or Vue.
+- UI adapters must not directly orchestrate data, backtest, or runtime core modules.
+- Do not introduce React and Vue together; the V2 frontend decision is React + TypeScript + Vite.
+- The V1 golden regression, schemas, manifests, artifacts, strategy, costs, contract rules,
+  next-bar-open execution, and 13:35 flatten behavior must not change.
+- V2 Task 1 must not bypass the application service boundary.
+
 This file defines the development instructions for AI coding agents working on this repository.
 
 Repository: `Taiwan-Index-Futures-Quant`

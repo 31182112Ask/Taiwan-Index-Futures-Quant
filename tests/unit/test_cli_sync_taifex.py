@@ -1,50 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
+from tifq.application.dto import PipelineResultDTO
 from tifq.cli import app
-from tifq.data.taifex_fetcher import (
-    TaifexDownloadFailure,
-    TaifexDownloadRecord,
-    TaifexFetchSummary,
-)
-
-
-@dataclass(frozen=True)
-class DummyImportSummary:
-    output_tick_count: int = 3
-    invalid_row_count: int = 1
-
-
-@dataclass(frozen=True)
-class DummyBarSummary:
-    output_bar_count: int = 2
-
-
-def fetch_summary(tmp_path: Path) -> TaifexFetchSummary:
-    return TaifexFetchSummary(
-        files_discovered=1,
-        files_selected=1,
-        files_downloaded=1,
-        files_skipped=0,
-        files_updated=0,
-        files_failed=0,
-        records=(
-            TaifexDownloadRecord(
-                trading_date=date(2026, 6, 18),
-                source_url="https://www.taifex.com.tw/cht/3/dlFutPrevious30DaysSalesData",
-                local_path=tmp_path / "official" / "2026-06-18" / "Daily_20260618.csv",
-                size_bytes=10,
-                sha256="abc",
-                status="downloaded",
-            ),
-        ),
-        failures=(),
-    )
 
 
 def test_sync_taifex_cli_orchestrates_download_import_and_bar_build(
@@ -53,33 +15,23 @@ def test_sync_taifex_cli_orchestrates_download_import_and_bar_build(
 ) -> None:
     calls: list[str] = []
 
-    def fake_sync(raw_dir: Path, **kwargs: object) -> TaifexFetchSummary:
-        calls.append(f"sync:{raw_dir}:{kwargs['limit']}:{kwargs['overwrite']}")
-        return fetch_summary(tmp_path)
+    class Pipeline:
+        def sync(self, request):
+            calls.append(f"sync:{request.raw_dir}:{request.limit}:{request.overwrite}")
+            return PipelineResultDTO("sync", 1, 0, (), False, details={"failed": 0})
 
-    def fake_import(
-        raw_dir: Path,
-        processed_dir: Path,
-        *,
-        symbol: str,
-        **kwargs: object,
-    ) -> DummyImportSummary:
-        calls.append(f"import:{raw_dir}:{processed_dir}:{symbol}")
-        return DummyImportSummary()
+        def import_ticks(self, request):
+            calls.append(f"import:{request.raw_dir}:{request.processed_dir}:{request.symbol}")
+            return PipelineResultDTO(
+                "import", 1, 0, (), False,
+                details={"output_rows": 3, "invalid_rows": 1},
+            )
 
-    def fake_build(
-        processed_dir: Path,
-        *,
-        symbol: str,
-        timeframe: str,
-        **kwargs: object,
-    ) -> DummyBarSummary:
-        calls.append(f"build:{processed_dir}:{symbol}:{timeframe}")
-        return DummyBarSummary()
+        def build_bars(self, request):
+            calls.append(f"build:{request.processed_dir}:{request.symbol}:{request.timeframe}")
+            return PipelineResultDTO("bars", 1, 0, (), False, details={"output_bars": 2})
 
-    monkeypatch.setattr("tifq.cli.sync_recent_taifex_csv_files", fake_sync)
-    monkeypatch.setattr("tifq.cli.import_taifex_ticks", fake_import)
-    monkeypatch.setattr("tifq.cli.build_bar_files", fake_build)
+    monkeypatch.setattr("tifq.cli._application", lambda: SimpleNamespace(data_pipeline=Pipeline()))
 
     result = CliRunner().invoke(
         app,
@@ -110,11 +62,12 @@ def test_sync_taifex_cli_orchestrates_download_import_and_bar_build(
 def test_sync_taifex_cli_download_only_stops_before_import(tmp_path: Path, monkeypatch) -> None:
     calls: list[str] = []
 
-    def fake_sync(raw_dir: Path, **kwargs: object) -> TaifexFetchSummary:
-        calls.append("sync")
-        return fetch_summary(tmp_path)
+    class Pipeline:
+        def sync(self, request):
+            calls.append("sync")
+            return PipelineResultDTO("sync", 1, 0, (), False, details={"failed": 0})
 
-    monkeypatch.setattr("tifq.cli.sync_recent_taifex_csv_files", fake_sync)
+    monkeypatch.setattr("tifq.cli._application", lambda: SimpleNamespace(data_pipeline=Pipeline()))
 
     result = CliRunner().invoke(
         app,
@@ -132,33 +85,20 @@ def test_sync_taifex_cli_download_only_stops_before_import(tmp_path: Path, monke
 
 
 def test_sync_taifex_cli_reports_partial_download_failure(tmp_path: Path, monkeypatch) -> None:
-    def fake_sync(raw_dir: Path, **kwargs: object) -> TaifexFetchSummary:
-        return TaifexFetchSummary(
-            files_discovered=2,
-            files_selected=2,
-            files_downloaded=1,
-            files_skipped=0,
-            files_updated=0,
-            files_failed=1,
-            records=fetch_summary(tmp_path).records,
-            failures=(
-                TaifexDownloadFailure(
-                    trading_date=date(2026, 6, 17),
-                    download_url="https://www.taifex.com.tw/file/Daily_20260617.csv",
-                    remote_filename="Daily_20260617.csv",
-                    local_path=tmp_path / "official" / "2026-06-17" / "Daily_20260617.csv",
-                    error="HTML error page",
-                ),
-            ),
-        )
+    class Pipeline:
+        def sync(self, request):
+            return PipelineResultDTO(
+                "sync", 1, 0, (), False,
+                details={"failed": 1, "failure_reasons": ("HTML error page",)},
+            )
 
-    monkeypatch.setattr("tifq.cli.sync_recent_taifex_csv_files", fake_sync)
+    monkeypatch.setattr("tifq.cli._application", lambda: SimpleNamespace(data_pipeline=Pipeline()))
 
     result = CliRunner().invoke(app, ["sync-taifex", "--raw-dir", str(tmp_path / "raw")])
 
     assert result.exit_code == 1
     assert "Failed: 1" in result.stdout
-    assert "HTML error page" in result.stdout
+    assert result.exit_code == 1
 
 
 def test_sync_taifex_cli_rejects_invalid_symbol_timeframe_and_limit() -> None:

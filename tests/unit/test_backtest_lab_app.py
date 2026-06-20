@@ -9,7 +9,9 @@ import plotly.graph_objects as go
 import pytest
 import yaml
 
-from tifq.apps.backtest_lab import (
+from tifq.config.models import BacktestConfig
+from tifq.data.taifex_fetcher import TaifexDownloadFailure, TaifexFetchSummary
+from tifq.interfaces.streamlit.app import (
     ResultRun,
     _element_key,
     _load_chart_bars,
@@ -22,8 +24,6 @@ from tifq.apps.backtest_lab import (
     load_result_run,
     sync_workflow_outcome,
 )
-from tifq.config.models import BacktestConfig
-from tifq.data.taifex_fetcher import TaifexDownloadFailure, TaifexFetchSummary
 
 
 class ChartRecorder:
@@ -252,9 +252,11 @@ def test_load_chart_bars_calculates_indicators_before_tail(
         result["realized_volatility"] = range(len(result))
         return result
 
-    monkeypatch.setattr("tifq.apps.backtest_lab.load_configured_bars", fake_load_configured_bars)
     monkeypatch.setattr(
-        "tifq.apps.backtest_lab.append_basic_indicators",
+        "tifq.interfaces.streamlit.app.load_configured_bars", fake_load_configured_bars
+    )
+    monkeypatch.setattr(
+        "tifq.interfaces.streamlit.app.append_basic_indicators",
         fake_append_basic_indicators,
     )
 
