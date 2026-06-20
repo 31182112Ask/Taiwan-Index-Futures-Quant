@@ -4,6 +4,7 @@ import os
 from datetime import date
 from pathlib import Path
 
+from click import unstyle
 from typer.testing import CliRunner
 
 from tifq.cli import _workflow_cli_marker, app
@@ -71,7 +72,7 @@ def test_sync_overwrite_requires_yes() -> None:
     )
 
     assert result.exit_code == 2
-    assert "requires explicit --yes" in result.stderr
+    assert "requires explicit --yes" in unstyle(result.stderr)
 
 
 def test_sync_plan_does_not_call_download(monkeypatch, tmp_path: Path) -> None:
@@ -112,9 +113,10 @@ def test_workflow_help_lists_stop_and_machine_readable_options() -> None:
     result = runner.invoke(app, ["workflow", "--help"], terminal_width=200, color=False)
 
     assert result.exit_code == 0
-    assert "--stop-after" in result.stdout
-    assert "--quiet" in result.stdout
-    assert "--json" in result.stdout
+    output = unstyle(result.stdout)
+    assert "--stop-after" in output
+    assert "--quiet" in output
+    assert "--json" in output
 
 
 def test_workflow_markers_are_safe_on_windows_legacy_code_pages() -> None:
