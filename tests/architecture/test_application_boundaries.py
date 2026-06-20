@@ -59,4 +59,3 @@ def test_legacy_streamlit_entry_point_is_thin() -> None:
     path = SRC / "apps" / "backtest_lab.py"
     assert len(path.read_text(encoding="utf-8").splitlines()) <= 15
     assert imported_modules(path) == {"tifq.interfaces.streamlit.app"}
-

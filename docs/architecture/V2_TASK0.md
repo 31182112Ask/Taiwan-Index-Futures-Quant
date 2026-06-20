@@ -30,4 +30,3 @@ not bypass the services or change V1 behavior.
 
 Task 0 contains no FastAPI endpoint, React/Vue project, WebSocket, broker API, live feed,
 paper trading, night session, or new strategy.
-

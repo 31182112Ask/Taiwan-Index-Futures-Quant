@@ -18,4 +18,3 @@ HTTP, open-file, or subprocess objects.
 
 The V1 Streamlit adapter temporarily uses an application-owned compatibility surface to
 preserve its frozen interaction behavior. New interfaces use the facade services directly.
-
