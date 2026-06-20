@@ -1,0 +1,21 @@
+{
+  "signal_sides": ["BUY", "FLAT", "HOLD"],
+  "trades": [
+    {
+      "entry_time": "2026-06-17T09:05:00+08:00",
+      "exit_time": "2026-06-17T09:10:00+08:00",
+      "entry_price": 102.0,
+      "exit_price": 104.0,
+      "exit_reason": "force_flatten",
+      "fee": 10.0,
+      "tax": 0.0,
+      "slippage": 20.0,
+      "net_pnl": 10.0
+    }
+  ],
+  "metrics": {
+    "final_equity": 100010.0,
+    "net_pnl": 10.0,
+    "trade_count": 1
+  }
+}

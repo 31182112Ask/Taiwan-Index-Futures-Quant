@@ -4,32 +4,24 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
 import typer
 from pydantic import ValidationError
 
 from tifq import __version__
-from tifq.backtest import (
-    persist_backtest_result,
-    prepare_backtest,
-    run_backtest_from_config,
+from tifq.application import ApplicationFacade, create_application
+from tifq.application.dto import (
+    BuildBarsRequest,
+    DownloadPlanDTO,
+    ImportRequest,
+    PipelineResultDTO,
+    SyncRequest,
 )
-from tifq.bars import build_bar_files
-from tifq.config import ConfigLoadError, load_backtest_config
-from tifq.data import (
-    TaifexDownloadPlan,
+from tifq.application.ui_support import (
+    ConfigLoadError,
     TaifexFetchError,
-    TaifexFetchSummary,
-    import_taifex_ticks,
-    plan_recent_taifex_csv_files,
-    sync_recent_taifex_csv_files,
-)
-from tifq.runtime import (
-    apply_confirmed_cleanup,
-    apply_safe_cleanup,
-    build_cleanup_plan,
-    run_environment_health_check,
+    load_backtest_config,
 )
 from tifq.runtime.locking import (
     OperationLockError,
@@ -63,6 +55,10 @@ CONFIG_FILES = (
 )
 
 
+def _application() -> ApplicationFacade:
+    return create_application(Path.cwd())
+
+
 @app.command("doctor")
 def doctor(
     full: Annotated[
@@ -71,18 +67,18 @@ def doctor(
     ] = False,
 ) -> None:
     """Check local runtime structure, manifests, locks, and conflicts."""
-    report = run_environment_health_check(Path.cwd(), full_scan=full)
+    report = _application().environment.check(full_scan=full)
     color = typer.colors.GREEN if report.status == "healthy" else typer.colors.YELLOW
     if report.status == "error":
         color = typer.colors.RED
     typer.secho(f"Environment status: {report.status}", fg=color)
     typer.echo(f"Checked in: {report.duration_seconds:.3f}s")
     typer.echo(f"Healthy files/directories: {report.healthy_files}")
-    typer.echo(f"Safe cleanup actions: {report.cleanup_plan.safe_action_count}")
-    typer.echo(f"Review-required actions: {report.cleanup_plan.confirmation_action_count}")
+    typer.echo(f"Safe cleanup actions: {report.safe_cleanup_count}")
+    typer.echo(f"Review-required actions: {report.confirmation_cleanup_count}")
     for issue in report.issues:
-        path = f" [{issue.path}]" if issue.path is not None else ""
-        typer.echo(f"  {issue.severity.upper()} {issue.code}{path}: {issue.message}")
+        path = f" [{issue['path']}]" if issue.get("path") is not None else ""
+        typer.echo(f"  {str(issue['severity']).upper()} {issue['code']}{path}: {issue['message']}")
     if report.status == "error":
         raise typer.Exit(code=1)
 
@@ -111,8 +107,8 @@ def clean(
     ] = 20,
 ) -> None:
     """Plan conservative cleanup; dry-run unless an explicit apply flag is present."""
-    plan = build_cleanup_plan(
-        Path.cwd(),
+    service = _application().environment
+    plan = service.build_cleanup_plan(
         full_scan=full_scan or quarantine_duplicates,
         prune_results=prune_results,
         keep_latest=keep_latest,
@@ -129,18 +125,18 @@ def clean(
     failures: list[str] = []
     try:
         if apply_safe:
-            summary = apply_safe_cleanup(plan, Path.cwd())
+            summary = service.apply_safe_cleanup()
             reclaimed += summary.bytes_reclaimed
             failures.extend(summary.failed)
             typer.echo(f"Safe actions applied: {len(summary.applied)}")
-        confirmed_actions = tuple(
-            action
+        confirmed_action_ids = tuple(
+            action.action_id
             for action in plan.actions
             if (quarantine_duplicates and "duplicate raw content" in action.reason)
             or (prune_results and "old result" in action.reason)
         )
-        if confirmed_actions:
-            summary = apply_confirmed_cleanup(confirmed_actions, Path.cwd())
+        if confirmed_action_ids:
+            summary = service.apply_confirmed_cleanup(confirmed_action_ids)
             failures.extend(summary.failed)
             typer.echo(f"Items quarantined: {len(summary.applied)}")
     except OperationLockError as exc:
@@ -219,11 +215,8 @@ def import_taifex(
     if symbol != "TMF":
         raise typer.BadParameter("V1 supports TMF only.")
     try:
-        summary = import_taifex_ticks(
-            raw_dir,
-            processed_dir,
-            symbol=symbol,
-            progress_callback=_progress_callback(quiet),
+        summary = _application().data_pipeline.import_ticks(
+            ImportRequest(raw_dir, processed_dir, symbol),
         )
     except OperationLockError as exc:
         typer.secho(format_lock_conflict(exc), fg=typer.colors.YELLOW, err=True)
@@ -233,13 +226,13 @@ def import_taifex(
         raise typer.Exit(code=1) from exc
 
     typer.secho("TAIFEX import completed.", fg=typer.colors.GREEN)
-    typer.echo(f"Raw files discovered: {summary.files_discovered}")
-    typer.echo(f"CSV files read: {summary.csv_files_read}")
-    typer.echo(f"Input rows: {summary.input_row_count}")
-    typer.echo(f"Clean TMF ticks: {summary.output_tick_count}")
-    typer.echo(f"Invalid or filtered rows: {summary.invalid_row_count}")
-    typer.echo(f"Unchanged raw files: {summary.files_skipped}")
-    typer.echo(f"Changed raw files: {summary.files_changed}")
+    typer.echo(f"Raw files discovered: {summary.details.get('files_discovered', 0)}")
+    typer.echo(f"CSV files read: {summary.details.get('csv_files_read', 0)}")
+    typer.echo(f"Input rows: {summary.details['input_rows']}")
+    typer.echo(f"Clean TMF ticks: {summary.details['output_rows']}")
+    typer.echo(f"Invalid or filtered rows: {summary.details['invalid_rows']}")
+    typer.echo(f"Unchanged raw files: {summary.skipped}")
+    typer.echo(f"Changed raw files: {summary.changed}")
     typer.echo(f"No changes: {summary.no_op}")
     if summary.output_paths:
         typer.echo("Output files:")
@@ -272,12 +265,10 @@ def build_bars(
     if timeframe not in {"1m", "5m"}:
         raise typer.BadParameter("V1 supports only 1m and 5m timeframes.")
     try:
-        summary = build_bar_files(
-            processed_dir,
-            symbol=symbol,
-            timeframe=timeframe,
-            force=force,
-            progress_callback=_progress_callback(quiet),
+        summary = _application().data_pipeline.build_bars(
+            BuildBarsRequest(
+                processed_dir, symbol, cast(Literal["1m", "5m"], timeframe), force
+            ),
         )
     except OperationLockError as exc:
         typer.secho(format_lock_conflict(exc), fg=typer.colors.YELLOW, err=True)
@@ -287,11 +278,11 @@ def build_bars(
         raise typer.Exit(code=1) from exc
 
     typer.secho("Bar build completed.", fg=typer.colors.GREEN)
-    typer.echo(f"Tick files read: {summary.tick_files_read}")
-    typer.echo(f"Input ticks: {summary.input_tick_count}")
-    typer.echo(f"Output bars: {summary.output_bar_count}")
-    typer.echo(f"Unchanged tick files: {summary.tick_files_skipped}")
-    typer.echo(f"Rebuilt tick files: {summary.tick_files_rebuilt}")
+    typer.echo(f"Tick files read: {summary.changed}")
+    typer.echo(f"Input ticks: {summary.details['input_ticks']}")
+    typer.echo(f"Output bars: {summary.details['output_bars']}")
+    typer.echo(f"Unchanged tick files: {summary.skipped}")
+    typer.echo(f"Rebuilt tick files: {summary.changed}")
     typer.echo(f"No changes: {summary.no_op}")
     if summary.output_paths:
         typer.echo("Output files:")
@@ -359,10 +350,8 @@ def sync_taifex(
 
     if plan:
         try:
-            download_plan = plan_recent_taifex_csv_files(
-                raw_dir,
-                limit=limit,
-                progress_callback=_progress_callback(quiet),
+            download_plan = _application().data_pipeline.plan_sync(
+                SyncRequest(raw_dir, limit, overwrite)
             )
         except (OSError, ValueError, TaifexFetchError) as exc:
             typer.secho(f"TAIFEX plan failed: {exc}", fg=typer.colors.RED, err=True)
@@ -373,12 +362,7 @@ def sync_taifex(
         return
 
     try:
-        fetch_summary = sync_recent_taifex_csv_files(
-            raw_dir,
-            limit=limit,
-            overwrite=overwrite,
-            progress_callback=_progress_callback(quiet),
-        )
+        fetch_summary = _application().data_pipeline.sync(SyncRequest(raw_dir, limit, overwrite))
     except OperationLockError as exc:
         typer.secho(format_lock_conflict(exc), fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(code=1) from exc
@@ -387,25 +371,20 @@ def sync_taifex(
         raise typer.Exit(code=1) from exc
 
     _print_taifex_fetch_summary(fetch_summary)
-    if fetch_summary.files_failed:
+    if _as_int(fetch_summary.details.get("failed", 0)):
         raise typer.Exit(code=1)
 
     import_summary = None
     bar_summary = None
     try:
         if not download_only:
-            progress = _progress_callback(quiet)
-            import_summary = import_taifex_ticks(
-                raw_dir,
-                processed_dir,
-                symbol=symbol,
-                progress_callback=progress,
+            import_summary = _application().data_pipeline.import_ticks(
+                ImportRequest(raw_dir, processed_dir, symbol),
             )
-            bar_summary = build_bar_files(
-                processed_dir,
-                symbol=symbol,
-                timeframe=timeframe,
-                progress_callback=progress,
+            bar_summary = _application().data_pipeline.build_bars(
+                BuildBarsRequest(
+                    processed_dir, symbol, cast(Literal["1m", "5m"], timeframe)
+                ),
             )
     except OperationLockError as exc:
         typer.secho(format_lock_conflict(exc), fg=typer.colors.YELLOW, err=True)
@@ -415,10 +394,10 @@ def sync_taifex(
         raise typer.Exit(code=1) from exc
 
     if import_summary is not None:
-        typer.echo(f"Clean TMF ticks: {import_summary.output_tick_count}")
-        typer.echo(f"Invalid or filtered rows: {import_summary.invalid_row_count}")
+        typer.echo(f"Clean TMF ticks: {import_summary.details['output_rows']}")
+        typer.echo(f"Invalid or filtered rows: {import_summary.details['invalid_rows']}")
     if bar_summary is not None:
-        typer.echo(f"Built bars: {bar_summary.output_bar_count}")
+        typer.echo(f"Built bars: {bar_summary.details['output_bars']}")
         import_no_op = bool(getattr(import_summary, "no_op", False))
         bar_no_op = bool(getattr(bar_summary, "no_op", False))
         typer.echo(f"Pipeline no changes: {import_no_op and bar_no_op}")
@@ -439,16 +418,7 @@ def backtest(
         typer.secho(f"Config validation failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     try:
-        progress_callback = _progress_callback(quiet)
-        result = run_backtest_from_config(
-            loaded_config,
-            progress_callback=progress_callback,
-        )
-        report_paths = persist_backtest_result(
-            loaded_config,
-            result,
-            progress_callback=progress_callback,
-        )
+        result = _application().backtest.run(loaded_config)
     except OperationLockError as exc:
         typer.secho(format_lock_conflict(exc), fg=typer.colors.YELLOW, err=True)
         raise typer.Exit(code=1) from exc
@@ -472,17 +442,20 @@ def backtest(
     typer.echo(f"Net PnL: {result.metrics['net_pnl']:.2f}")
     typer.echo(f"Max drawdown: {result.metrics['max_drawdown']:.2f}")
     typer.echo(f"Win rate: {result.metrics['win_rate']:.2%}")
-    typer.echo(f"Result directory: {report_paths.run_dir}")
-    typer.echo(f"  {report_paths.config_path}")
-    typer.echo(f"  {report_paths.trades_path}")
-    typer.echo(f"  {report_paths.equity_curve_path}")
-    typer.echo(f"  {report_paths.metrics_path}")
-    typer.echo(f"  {report_paths.model_bars_path}")
-    typer.echo(f"  {report_paths.signals_path}")
-    typer.echo(f"  {report_paths.contract_selection_path}")
-    typer.echo(f"  {report_paths.diagnostics_path}")
-    typer.echo(f"  {report_paths.timings_path}")
-    typer.echo(f"  {report_paths.data_fingerprint_path}")
+    typer.echo(f"Result directory: {result.run_dir}")
+    for name in (
+        "config.yaml",
+        "trades.csv",
+        "equity_curve.csv",
+        "metrics.json",
+        "model_bars.parquet",
+        "signals.csv",
+        "contract_selection.csv",
+        "diagnostics.json",
+        "timings.json",
+        "data_fingerprint.json",
+    ):
+        typer.echo(f"  {Path(result.run_dir) / name}")
 
 
 @app.command("workflow")
@@ -525,7 +498,8 @@ def workflow(
             typer.echo(f"[{marker}] {step}: {message}")
 
     try:
-        health = run_environment_health_check(Path.cwd())
+        application = _application()
+        health = application.environment.check()
         if health.status == "error":
             raise ValueError("environment health check has blocking errors")
         record("doctor", "complete", health.status)
@@ -533,10 +507,7 @@ def workflow(
             _finish_workflow(records, json_output)
             return
 
-        plan = plan_recent_taifex_csv_files(
-            loaded.data.raw_dir,
-            progress_callback=None if json_output else _progress_callback(quiet),
-        )
+        plan = application.data_pipeline.plan_sync(SyncRequest(Path(loaded.data.raw_dir), 30))
         if plan.conflict_count:
             raise ValueError(f"download plan has {plan.conflict_count} local conflicts")
         record(
@@ -548,75 +519,63 @@ def workflow(
             _finish_workflow(records, json_output)
             return
 
-        sync = sync_recent_taifex_csv_files(
-            loaded.data.raw_dir,
-            progress_callback=None if json_output else _progress_callback(quiet),
-        )
-        if sync.files_failed:
-            raise ValueError(f"{sync.files_failed} downloads failed")
+        sync = application.data_pipeline.sync(SyncRequest(Path(loaded.data.raw_dir), 30))
+        if _as_int(sync.details.get("failed", 0)):
+            raise ValueError(f"{sync.details['failed']} downloads failed")
         record(
             "sync",
             "complete",
             (
                 "all selected data already exists"
-                if sync.files_downloaded == 0 and sync.files_updated == 0
-                else f"downloaded {sync.files_downloaded}, updated {sync.files_updated}"
+                if sync.changed == 0
+                else f"downloaded or updated {sync.changed}"
             ),
         )
         if stop_after == "sync":
             _finish_workflow(records, json_output)
             return
 
-        imported = import_taifex_ticks(
-            loaded.data.raw_dir,
-            loaded.data.processed_dir,
-            progress_callback=None if json_output else _progress_callback(quiet),
+        imported = application.data_pipeline.import_ticks(
+            ImportRequest(
+                Path(loaded.data.raw_dir),
+                Path(loaded.data.processed_dir),
+                loaded.data.symbol,
+            )
         )
         record(
             "import",
             "complete",
-            "unchanged, skipped" if imported.no_op else f"changed {imported.files_changed}",
+            "unchanged, skipped" if imported.no_op else f"changed {imported.changed}",
         )
         if stop_after == "import":
             _finish_workflow(records, json_output)
             return
 
-        built = build_bar_files(
-            loaded.data.processed_dir,
-            symbol=loaded.data.symbol,
-            timeframe=loaded.data.timeframe,
-            progress_callback=None if json_output else _progress_callback(quiet),
+        built = application.data_pipeline.build_bars(
+            BuildBarsRequest(
+                Path(loaded.data.processed_dir),
+                loaded.data.symbol,
+                loaded.data.timeframe,
+            )
         )
         record(
             "bars",
             "complete",
-            "unchanged, skipped" if built.no_op else f"rebuilt {built.tick_files_rebuilt}",
+            "unchanged, skipped" if built.no_op else f"rebuilt {built.changed}",
         )
         if stop_after == "bars":
             _finish_workflow(records, json_output)
             return
 
-        prepared = prepare_backtest(
-            loaded,
-            progress_callback=None if json_output else _progress_callback(quiet),
-        )
-        record("preflight", "complete", f"{len(prepared.model_bars)} model bars")
+        prepared = application.backtest.preflight(loaded)
+        record("preflight", "complete", f"{prepared.summary.bar_count} model bars")
         if stop_after == "preflight":
             _finish_workflow(records, json_output)
             return
 
-        result = run_backtest_from_config(
-            loaded,
-            preflight=prepared,
-            progress_callback=None if json_output else _progress_callback(quiet),
-        )
+        result = application.backtest.run(loaded, prepared)
         record("backtest", "complete", f"{result.metrics['trade_count']} trades")
-        paths = persist_backtest_result(
-            loaded,
-            result,
-            progress_callback=None if json_output else _progress_callback(quiet),
-        )
-        record("persist", "complete", str(paths.run_dir))
+        record("persist", "complete", result.run_dir)
     except OperationLockError as exc:
         record("workflow", "warning", format_lock_conflict(exc))
         _finish_workflow(records, json_output)
@@ -633,36 +592,31 @@ def _finish_workflow(records: list[dict[str, object]], json_output: bool) -> Non
         typer.echo(json.dumps({"steps": records}, ensure_ascii=False, indent=2))
 
 
+def _as_int(value: object) -> int:
+    return int(value) if isinstance(value, (int, str)) else 0
+
+
 def _workflow_cli_marker(status: str) -> str:
     """Return terminal markers safe on Windows legacy code pages."""
     return {"complete": "OK", "warning": "WARN", "running": "..."}.get(status, "-")
 
 
-def _print_taifex_fetch_summary(fetch_summary: TaifexFetchSummary) -> None:
+def _print_taifex_fetch_summary(fetch_summary: PipelineResultDTO) -> None:
     typer.secho("Official TAIFEX sync completed.", fg=typer.colors.GREEN)
-    typer.echo(f"Remote files discovered: {fetch_summary.files_discovered}")
-    typer.echo(f"Files selected: {fetch_summary.files_selected}")
-    typer.echo(f"Downloaded: {fetch_summary.files_downloaded}")
-    typer.echo(f"Skipped: {fetch_summary.files_skipped}")
-    typer.echo(f"Updated: {fetch_summary.files_updated}")
-    typer.echo(f"Failed: {fetch_summary.files_failed}")
-    if fetch_summary.records:
-        typer.echo("Download records:")
-        for record in fetch_summary.records:
-            typer.echo(f"  {record.trading_date} {record.status} {record.local_path}")
-    if fetch_summary.failures:
-        typer.echo("Download failures:")
-        for failure in fetch_summary.failures:
-            typer.echo(f"  {failure.trading_date} failed {failure.local_path}: {failure.error}")
+    typer.echo(f"Remote files discovered: {fetch_summary.details.get('discovered', 0)}")
+    typer.echo(f"Files selected: {fetch_summary.changed + fetch_summary.skipped}")
+    typer.echo(f"Downloaded or updated: {fetch_summary.changed}")
+    typer.echo(f"Skipped: {fetch_summary.skipped}")
+    typer.echo(f"Failed: {fetch_summary.details.get('failed', 0)}")
 
 
-def _print_download_plan(download_plan: TaifexDownloadPlan) -> None:
+def _print_download_plan(download_plan: DownloadPlanDTO) -> None:
     typer.echo("TAIFEX download plan:")
     for item in download_plan.items:
         typer.echo(
-            f"  {item.remote.trading_date} {item.status} "
-            f"{item.remote.remote_filename} -> {item.local_path} "
-            f"[{item.recommended_action}]"
+            f"  {item['trading_date']} {item['status']} "
+            f"{item['remote_filename']} -> {item['local_path']} "
+            f"[{item['recommended_action']}]"
         )
     typer.echo(f"Valid existing: {download_plan.valid_existing_count}")
     typer.echo(f"Missing or changed: {download_plan.missing_count}")
@@ -707,13 +661,14 @@ def backtest_lab(
     for directory in DATA_DIRS:
         directory.mkdir(parents=True, exist_ok=True)
     remove_stale_operation_locks(Path("data/.runtime"))
-    report = run_environment_health_check(Path.cwd())
-    cleanup_summary = apply_safe_cleanup(report.cleanup_plan, Path.cwd())
+    environment = _application().environment
+    report = environment.check()
+    cleanup_summary = environment.apply_safe_cleanup()
     typer.echo("Environment check:")
     typer.echo(f"  status: {report.status}")
     typer.echo(f"  healthy files: {report.healthy_files}")
     typer.echo(f"  stale temporary files removed: {len(cleanup_summary.applied)}")
-    typer.echo(f"  duplicate candidates: {report.cleanup_plan.confirmation_action_count}")
+    typer.echo(f"  duplicate candidates: {report.confirmation_cleanup_count}")
     typer.echo(f"  reclaimed: {cleanup_summary.bytes_reclaimed} bytes")
     app_path = Path(__file__).parent / "apps" / "backtest_lab.py"
     typer.secho(f"Starting Streamlit Backtest Lab at http://{host}:{port}", fg=typer.colors.GREEN)
